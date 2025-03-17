@@ -8,6 +8,7 @@
 #include <linux/bitops.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
+#include <linux/kthread.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/memcontrol.h>
@@ -16,13 +17,19 @@
 #include <linux/page-flags.h>
 #include <linux/page_ref.h>
 #include <linux/printk.h>
+#include <linux/sched.h>
 #include <linux/spinlock.h>
 
 #include "tmem_vmscan.h"
 
+#define MAX_NODES 100
 
 // static struct scan_control = { }
 
+
+// Temporary list to hold references to tmem daemons.
+// Probably remove this later and store tmemd in place of kswapd.
+static struct task_struct *tmem_d_list[MAX_NODES];
 
 /**
  * These should be moved later to its own file for generic use.
@@ -142,20 +149,48 @@ static void scan_node(pg_data_t *pgdat, int nid)
 }
 
 
-// static int mpromoted(void *p)
+static int tmemd(void *p) {
+	pr_info( "tmem-csc450 thread started..\n" );
+
+    pg_data_t *pgdat = (pg_data_t *)p;
+    int nid = pgdat->node_id;
+
+    for ( ; ; )
+    {
+		scan_node(pgdat, nid);
+
+        if(kthread_should_stop())
+            break;
+
+		msleep(10000);
+    }
+	return 0;
+}
 
 
 /**
- * avail_nodes - scan the available system nodes
+ * available_nodes - start tmemd on all available nodes
  */
-void avail_nodes(void) 
+void available_nodes(void) 
 {
 	int nid;
 	
 	for_each_online_node(nid)
 	{
 		pg_data_t *pgdat = NODE_DATA(nid);
-		scan_node(pgdat, nid);
+
+        tmem_d_list[nid] = kthread_run(&tmemd, NULL, "tmemd", nid);
 	}
 	//return num_online_nodes();
+}
+
+
+void tmem_try_to_stop(void)
+{
+    int nid;
+
+    for_each_online_node(nid)
+    {
+        kthread_stop(tmem_d_list[nid]);
+    }
 }

@@ -16,30 +16,17 @@ MODULE_AUTHOR("CSC450 Group 4");
 MODULE_DESCRIPTION("Tiered memory module.");
 
 
-static struct task_struct *kernel_thread1;
-
-
-int thread_function(void *arg) {
-	pr_info( "tmem-csc450 thread started..\n" );
-	init_kallsyms();
-	while (!kthread_should_stop()) {
-		avail_nodes();
-		msleep(10000);
-	}
-	return 0;
-}
-
-
 static int __init tmem_init(void) {
 	pr_info( "tmem-csc450 module initializing..\n" );
-	kernel_thread1 = kthread_run(&thread_function, NULL, "thread_function");
+	init_kallsyms();
+    available_nodes();
 	return 0;
 }
 
 
 static void __exit tmem_exit(void) {
 	pr_info("tmem-csc450 exiting..\n");
-	kthread_stop(kernel_thread1);
+    tmem_try_to_stop();
 }
 
 
