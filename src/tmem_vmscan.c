@@ -18,7 +18,7 @@
 #include <linux/printk.h>
 #include <linux/spinlock.h>
 
-#include "tmemscan.h"
+#include "tmem_vmscan.h"
 
 
 // static struct scan_control = { }
