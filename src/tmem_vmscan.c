@@ -6,6 +6,7 @@
  */
 #include <linux/atomic.h>
 #include <linux/bitops.h>
+#include <linux/delay.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/kthread.h>
@@ -179,7 +180,7 @@ void available_nodes(void)
 	{
 		pg_data_t *pgdat = NODE_DATA(nid);
 
-        tmem_d_list[nid] = kthread_run(&tmemd, NULL, "tmemd", nid);
+        tmem_d_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
 	}
 	//return num_online_nodes();
 }
