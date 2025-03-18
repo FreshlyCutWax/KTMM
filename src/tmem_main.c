@@ -8,7 +8,7 @@
 #include <linux/sched.h>
 #include <linux/stat.h>
 
-
+#include "tmem_syms.h"
 #include "tmem_vmscan.h"
 
 MODULE_LICENSE("GPL");
@@ -18,7 +18,8 @@ MODULE_DESCRIPTION("Tiered memory module.");
 
 static int __init tmem_init(void) {
 	pr_info( "tmem-csc450 module initializing..\n" );
-	init_kallsyms();
+	//init_kallsyms();
+    init_module_syms();
     available_nodes();
 	return 0;
 }

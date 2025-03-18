@@ -21,12 +21,14 @@
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 
+#include "tmem_syms.h"
 #include "tmem_vmscan.h"
 
 #define MAX_NODES 100
 
-// static struct scan_control = { }
+extern kallsyms_lookup_name_t tmem_kallsyms_lookup_name;
 
+// static struct scan_control = { }
 
 // Temporary list to hold references to tmem daemons.
 // Probably remove this later and store tmemd in place of kswapd.
@@ -34,7 +36,6 @@ static struct task_struct *tmem_d_list[MAX_NODES];
 
 /**
  * These should be moved later to its own file for generic use.
- */
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 kallsyms_lookup_name_t tmem_kallsyms_lookup_name;
 
@@ -50,6 +51,7 @@ void init_kallsyms()
 	tmem_kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
 	unregister_kprobe(&kp);
 }
+*/
 
 
 /*****************************************************************************
