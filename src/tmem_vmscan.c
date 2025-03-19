@@ -26,6 +26,29 @@
 
 #define MAX_NODES 100
 
+#define tmem_cgroup_iter_addr tmem_kallsyms_lookup_name("mem_cgroup_iter")
+
+
+static struct mem_cgroup *tmem_cgroup_iter(
+	struct mem_cgroup *root,
+	struct mem_cgroup *prev,
+	struct mem_cgroup_reclaim_cookie *reclaim)
+{
+	struct mem_cgroup *(*cgroup_iter_fn)(
+		struct mem_cgroup *r, 
+		struct mem_cgroup *pv,
+		struct mem_cgroup_reclaim_cookie *rc)
+		    = (struct mem_cgroup *(*)(struct mem_cgroup *, 
+			struct mem_cgroup *, 
+			struct mem_cgroup_reclaim_cookie *)
+			)tmem_cgroup_iter_addr;
+
+	return cgroup_iter_fn(root, prev, reclaim);
+}
+
+
+
+
 // static struct scan_control = { }
 
 // Temporary list to hold references to tmem daemons.
@@ -80,17 +103,20 @@ static void scan_node(pg_data_t *pgdat, int nid)
 	struct mem_cgroup *memcg;
 	struct mem_cgroup *root;
 	struct lruvec *lruvec;
-	unsigned long cgroup_iter_addr;
+	//unsigned long cgroup_iter_addr;
 
+	/*
 	// obtain address of mem_cgroup_iter()
 	cgroup_iter_addr = tmem_kallsyms_lookup_name("mem_cgroup_iter");
+	*/
 
-	if(cgroup_iter_addr)
+	if(tmem_cgroup_iter_addr)
 	{
 		// for debug purposes, change later
-		pr_info("mem_cgroup_iter function addr: %lu\n", cgroup_iter_addr);
+		pr_info("mem_cgroup_iter function addr: %lu\n", tmem_cgroup_iter_addr);
 
 		// get the mem_cgroup_iter() function from memory address
+		/*
 		struct mem_cgroup *(*cgroup_iter_fn)(struct mem_cgroup *root, 
 			struct mem_cgroup *prev,
 			struct mem_cgroup_reclaim_cookie *reclaim)
@@ -98,10 +124,12 @@ static void scan_node(pg_data_t *pgdat, int nid)
 				struct mem_cgroup *, 
 				struct mem_cgroup_reclaim_cookie *)
 				)cgroup_iter_addr;
+		*/
 
 		// get memory cgroup for the node
 		root = NULL;
-		memcg = cgroup_iter_fn(root, NULL, NULL);
+		//memcg = cgroup_iter_fn(root, NULL, NULL);
+		memcg = tmem_cgroup_iter(root, NULL, NULL);
 
 		lruvec = &memcg->nodeinfo[nid]->lruvec;
 
@@ -131,21 +159,24 @@ static void scan_node(pg_data_t *pgdat, int nid)
 }
 
 
-static int tmemd(void *p) {
-	pr_info( "tmem-csc450 thread started..\n" );
+static int tmemd(void *p) 
+{
+	pg_data_t *pgdat; 
+	int nid;
 
-    pg_data_t *pgdat = (pg_data_t *)p;
-    int nid = pgdat->node_id;
+	pgdat = (pg_data_t *)p;
+	nid = pgdat->node_id;
 
-    for ( ; ; )
-    {
+	for ( ; ; )
+	{
 		scan_node(pgdat, nid);
 
-        if(kthread_should_stop())
-            break;
+		if(kthread_should_stop())
+			break;
 
 		msleep(10000);
-    }
+	}
+
 	return 0;
 }
 
