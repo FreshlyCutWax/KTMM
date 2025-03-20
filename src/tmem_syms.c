@@ -1,17 +1,22 @@
+/*
+ * tmem_syms.c
+ */
+
 #include <linux/kprobes.h>
+
+#include "tmem_syms.h"
 
 /**
  * These should be moved later to its own file for generic use.
  */
-static struct kprobe kp_symslookup = {
+struct kprobe kp_symslookup = {
 	.symbol_name = "kallsyms_lookup_name"
 };
 
 
-void init_module_syms()
+void tmem_kallsyms_probe(kallsyms_lookup_name_t *fn)
 {
-    // register kallsyms_lookup_name
-	register_kprobe(&kp_sysmlookup);
-	tmem_kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
-	unregister_kprobe(&kp_sysmlookup);
+	register_kprobe(&kp_symslookup);
+	*fn = (kallsyms_lookup_name_t) kp_symslookup.addr;
+	unregister_kprobe(&kp_symslookup);
 }

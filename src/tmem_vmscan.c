@@ -26,27 +26,31 @@
 
 #define MAX_NODES 100
 
-#define tmem_cgroup_iter_addr tmem_kallsyms_lookup_name("mem_cgroup_iter")
 
+static tmem_cgroup_iter_t tmem_cgroup_iter;
+unsigned long tmem_cgroup_iter_addr;
 
-static struct mem_cgroup *tmem_cgroup_iter(
-	struct mem_cgroup *root,
-	struct mem_cgroup *prev,
-	struct mem_cgroup_reclaim_cookie *reclaim)
+bool init_vmscan_symbols()
 {
-	struct mem_cgroup *(*cgroup_iter_fn)(
-		struct mem_cgroup *r, 
-		struct mem_cgroup *pv,
-		struct mem_cgroup_reclaim_cookie *rc)
-		    = (struct mem_cgroup *(*)(struct mem_cgroup *, 
-			struct mem_cgroup *, 
-			struct mem_cgroup_reclaim_cookie *)
-			)tmem_cgroup_iter_addr;
+	unsigned long mem_cgroup_iter_addr;
+	kallsyms_lookup_name_t symbol_lookup;
 
-	return cgroup_iter_fn(root, prev, reclaim);
+	tmem_kallsyms_probe(&symbol_lookup);
+	
+	mem_cgroup_iter_addr = symbol_lookup("mem_cgroup_iter");
+	
+	if(mem_cgroup_iter_addr)
+	{
+		tmem_cgroup_iter_addr = mem_cgroup_iter_addr;
+
+		tmem_cgroup_iter = (struct mem_cgroup *(*)(struct mem_cgroup *,
+					struct mem_cgroup *,
+					struct mem_cgroup_reclaim_cookie *)
+					)mem_cgroup_iter_addr;
+	}
+
+	return true;
 }
-
-
 
 
 // static struct scan_control = { }
