@@ -28,7 +28,6 @@
 
 
 static tmem_cgroup_iter_t tmem_cgroup_iter;
-unsigned long tmem_cgroup_iter_addr;
 
 bool init_vmscan_symbols()
 {
@@ -41,15 +40,17 @@ bool init_vmscan_symbols()
 	
 	if(mem_cgroup_iter_addr)
 	{
-		tmem_cgroup_iter_addr = mem_cgroup_iter_addr;
-
 		tmem_cgroup_iter = (struct mem_cgroup *(*)(struct mem_cgroup *,
 					struct mem_cgroup *,
 					struct mem_cgroup_reclaim_cookie *)
 					)mem_cgroup_iter_addr;
+
+		// success getting symbols
+		return true;
 	}
 
-	return true;
+	// unsuccessful getting symbols
+	return false;
 }
 
 
@@ -107,59 +108,33 @@ static void scan_node(pg_data_t *pgdat, int nid)
 	struct mem_cgroup *memcg;
 	struct mem_cgroup *root;
 	struct lruvec *lruvec;
-	//unsigned long cgroup_iter_addr;
 
-	/*
-	// obtain address of mem_cgroup_iter()
-	cgroup_iter_addr = tmem_kallsyms_lookup_name("mem_cgroup_iter");
-	*/
+	// get memory cgroup for the node
+	root = NULL;
+	memcg = tmem_cgroup_iter(root, NULL, NULL);
 
-	if(tmem_cgroup_iter_addr)
+	lruvec = &memcg->nodeinfo[nid]->lruvec;
+
+	// scan the LRU lists
+	for_each_evictable_lru(lru) 
 	{
+		unsigned int ref_count;
+		unsigned long flags;
+		struct list_head *list;
+		list = &lruvec->lists[lru];
+
 		// for debug purposes, change later
-		pr_info("mem_cgroup_iter function addr: %lu\n", tmem_cgroup_iter_addr);
+		pr_info("Scanning evictable LRU list: %d\n", lru);
 
-		// get the mem_cgroup_iter() function from memory address
-		/*
-		struct mem_cgroup *(*cgroup_iter_fn)(struct mem_cgroup *root, 
-			struct mem_cgroup *prev,
-			struct mem_cgroup_reclaim_cookie *reclaim)
-			= (struct mem_cgroup *(*)(struct mem_cgroup *, 
-				struct mem_cgroup *, 
-				struct mem_cgroup_reclaim_cookie *)
-				)cgroup_iter_addr;
-		*/
+		spin_lock_irqsave(&lruvec->lru_lock, flags);
+		// call list_scan function
+		ref_count = scan_lru_list(list);
+		
+		spin_unlock_irqrestore(&lruvec->lru_lock, flags);
 
-		// get memory cgroup for the node
-		root = NULL;
-		//memcg = cgroup_iter_fn(root, NULL, NULL);
-		memcg = tmem_cgroup_iter(root, NULL, NULL);
-
-		lruvec = &memcg->nodeinfo[nid]->lruvec;
-
-		// scan the LRU lists
-		for_each_evictable_lru(lru) 
-		{
-			unsigned int ref_count;
-			unsigned long flags;
-			struct list_head *list;
-			list = &lruvec->lists[lru];
-
-			// for debug purposes, change later
-			pr_info("Scanning evictable LRU list: %d\n", lru);
-
-			spin_lock_irqsave(&lruvec->lru_lock, flags);
-			// call list_scan function
-			ref_count = scan_lru_list(list);
-			
-			spin_unlock_irqrestore(&lruvec->lru_lock, flags);
-
-			// for debug purpses, change later
-			pr_info("Reference count: %d\n", ref_count);
-		}
+		// for debug purpses, change later
+		pr_info("Reference count: %d\n", ref_count);
 	}
-	else
-		pr_info("tmem unable to get LRU lists");
 }
 
 
