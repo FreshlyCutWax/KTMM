@@ -26,8 +26,8 @@ typedef struct mem_cgroup *(*mem_cgroup_iter_t)(
  * 	- kallsyms_lookup_name
  * 	- mem_cgroup_iter
  */
-kallsyms_lookup_name_t symbol_lookup;	//kallsyms_lookup_name
-mem_cgroup_iter_t cgroup_iter;		//mem_cgroup_iter
+static kallsyms_lookup_name_t symbol_lookup;	//kallsyms_lookup_name
+static mem_cgroup_iter_t cgroup_iter;		//mem_cgroup_iter
 
 
 /**
@@ -36,15 +36,11 @@ mem_cgroup_iter_t cgroup_iter;		//mem_cgroup_iter
  * When this is registered, it will establish a break point
  * in the kernel where this symbol is located.
  */
-struct kprobe kp_symslookup = {
+static struct kprobe kp_symslookup = {
 	.symbol_name = "kallsyms_lookup_name"
 };
 
 /**
- * register_module_symbols - register hidden kernel symbols
- *
- * @return:	bool, if registering ALL symbols was successful
- *
  * This will use kallsyms_lookup_name to acquire and establish needed
  * functions and structures that would otherwise be unavailable to
  * kernel modules. Symbol addresses are used to recreate the functions
@@ -89,11 +85,6 @@ failure:
 /******************************************************************************
  * WRAPPERS
  ******************************************************************************/
-/**
- * tmem_cgroup_iter - module wrapper for mem_cgroup_iter
- *
- * Please reference [src/include/memcontrol.h]
- */
 struct mem_cgroup *tmem_cgroup_iter(struct mem_cgroup *root,
 			struct mem_cgroup *prev,
 			struct mem_cgroup_reclaim_cookie *reclaim)
