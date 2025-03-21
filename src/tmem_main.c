@@ -17,25 +17,21 @@ MODULE_DESCRIPTION("Tiered memory module.");
 
 
 static int __init tmem_init(void) {
-	int ret;
-
 	pr_info( "tmem-csc450 module initializing..\n" );
 	
 	if(register_module_symbols())
 	{
-		available_nodes();
-		ret = 0;
+		tmemd_start_available();
+		return 0;
 	}
-	else
-		ret = -EFAULT;
 	
-	return ret;
+	return -EFAULT;
 }
 
 
 static void __exit tmem_exit(void) {
 	pr_info("tmem-csc450 exiting..\n");
-	tmem_try_to_stop();
+	tmemd_stop_all();
 }
 
 

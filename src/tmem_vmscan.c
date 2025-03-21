@@ -134,23 +134,23 @@ static int tmemd(void *p)
 
 
 /**
- * available_nodes - start tmemd on all available nodes
+ * tmem_start_available - start tmemd on all available nodes
  */
-void available_nodes(void) 
+void tmemd_start_available(void) 
 {
 	int nid;
 	
 	for_each_online_node(nid)
 	{
 		pg_data_t *pgdat = NODE_DATA(nid);
-
-        tmem_d_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
+		
+        	tmem_d_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
 	}
 	//return num_online_nodes();
 }
 
 
-void tmem_try_to_stop(void)
+void tmemd_stop_all(void)
 {
     int nid;
 

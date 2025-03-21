@@ -2,8 +2,8 @@
 #ifndef TMEM_VMSCAN_HEADER_H
 #define TMEM_VMSCAN_HEADER_H
 
-void available_nodes(void);
+void tmemd_start_available(void);
 
-void tmem_try_to_stop(void);
+void tmemd_stop_all(void);
 
 #endif /* TMEM_VMSCAN_HEADER_H */
