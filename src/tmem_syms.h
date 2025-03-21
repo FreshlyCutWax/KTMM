@@ -2,10 +2,12 @@
 #ifndef TMEM_SYMS_HEADER_H
 #define TMEM_SYMS_HEADER_H
 
+#include <linux/memcontrol.h>
 
-typedef unsigned long (*kallsyms_lookup_name_t)(const char *symbol_name);
+bool register_module_symbols(void);
 
-void tmem_kallsyms_probe(kallsyms_lookup_name_t *fn);
-
+struct mem_cgroup *tmem_cgroup_iter(struct mem_cgroup *root,
+			struct mem_cgroup *prev,
+			struct mem_cgroup_reclaim_cookie *reclaim);
 
 #endif /* TMEM_SYMS_HEADER_H */

@@ -27,33 +27,6 @@
 #define MAX_NODES 100
 
 
-static tmem_cgroup_iter_t tmem_cgroup_iter;
-
-bool init_vmscan_symbols()
-{
-	unsigned long mem_cgroup_iter_addr;
-	kallsyms_lookup_name_t symbol_lookup;
-
-	tmem_kallsyms_probe(&symbol_lookup);
-	
-	mem_cgroup_iter_addr = symbol_lookup("mem_cgroup_iter");
-	
-	if(mem_cgroup_iter_addr)
-	{
-		tmem_cgroup_iter = (struct mem_cgroup *(*)(struct mem_cgroup *,
-					struct mem_cgroup *,
-					struct mem_cgroup_reclaim_cookie *)
-					)mem_cgroup_iter_addr;
-
-		// success getting symbols
-		return true;
-	}
-
-	// unsuccessful getting symbols
-	return false;
-}
-
-
 // static struct scan_control = { }
 
 // Temporary list to hold references to tmem daemons.

@@ -21,7 +21,7 @@ static int __init tmem_init(void) {
 
 	pr_info( "tmem-csc450 module initializing..\n" );
 	
-	if(init_vmscan_symbols())
+	if(register_module_symbols())
 	{
 		available_nodes();
 		ret = 0;
