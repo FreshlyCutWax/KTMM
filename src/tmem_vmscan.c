@@ -15,6 +15,7 @@
 #include <linux/memcontrol.h>
 #include <linux/mmzone.h>
 #include <linux/nodemask.h>
+#include <linux/numa.h>
 #include <linux/page-flags.h>
 #include <linux/page_ref.h>
 #include <linux/printk.h>
@@ -24,14 +25,11 @@
 #include "tmem_syms.h"
 #include "tmem_vmscan.h"
 
-#define MAX_NODES 100
-
-
 // static struct scan_control = { }
 
 // Temporary list to hold references to tmem daemons.
 // Probably remove this later and store tmemd in place of kswapd.
-static struct task_struct *tmem_d_list[MAX_NODES];
+static struct task_struct *tmem_d_list[MAX_NUMNODES];
 
 
 /*****************************************************************************
