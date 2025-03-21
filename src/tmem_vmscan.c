@@ -181,8 +181,6 @@ static int tmemd(void *p)
 
 
 /**
- * tmem_start_available - start tmem daemons on all online nodes
- *
  * Daemons are only started on online/active nodes. They are
  * currently stored in a local list, but will later need to be
  * stored with the node itself (in-place of kswapd in pglist_data).
@@ -209,8 +207,6 @@ void tmemd_start_available(void)
 
 
 /**
- * tmemd_stop_all - stop all tmem daemons on all online nodes
- *
  * This stops all thread daemons for each node when exiting.
  * It uses the node ID to grab the daemon out of our local list.
  */
