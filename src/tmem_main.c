@@ -25,6 +25,8 @@ static int __init tmem_init(void) {
 		return 0;
 	}
 	
+	// return error for invalid memory address
+	// we were unable to register all symbols
 	return -EFAULT;
 }
 
