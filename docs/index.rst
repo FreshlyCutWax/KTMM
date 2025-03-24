@@ -1,4 +1,3 @@
-
 KTMM: TIERED MEMORY MODULE
 ==========================
 
@@ -12,11 +11,3 @@ KTMM: TIERED MEMORY MODULE
         usage/requirements
         usage/installation
 
-
-
-Indices and tables
-==================
-
-* :ref:`genindex`
-* :ref:`modindex`
-* :ref:`search`
