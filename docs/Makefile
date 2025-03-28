@@ -7,7 +7,6 @@ SPHINXOPTS    ?=
 SPHINXBUILD   ?= sphinx-build
 SOURCEDIR     = .
 BUILDDIR      = _build
-RELEASEDIR    = _release
 
 .PHONY: help Makefile
 
