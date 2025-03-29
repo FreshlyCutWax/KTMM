@@ -10,19 +10,19 @@
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 #
-# import os
-# import sys
-# sys.path.insert(0, os.path.abspath('.'))
+import os
+import sys
+sys.path.insert(0, os.path.abspath('../src/'))
 
 
 # -- Project information -----------------------------------------------------
 
-project = 'CSC450 Tiered Memory Module'
-copyright = '2025, idk'
-author = 'JJGC'
+project = 'KTMM'
+copyright = '2025, '
+author = 'Jared Draper, Camilo Weinert-Palomino, Grant Wilke, Joshua Borthick'
 
 # The full version, including alpha/beta/rc tags
-release = '0.2'
+release = '0.1'
 
 
 # -- General configuration ---------------------------------------------------
@@ -32,6 +32,7 @@ release = '0.2'
 # ones.
 extensions = [
     'sphinx.ext.duration',
+    'sphinx.ext.githubpages',
 ]
 
 # Add any paths that contain templates here, relative to this directory.
