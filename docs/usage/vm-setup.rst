@@ -4,15 +4,12 @@ Testing Environment Setup
 This is a guide discussing how to setup the appropriate virtual machine for
 testing.
 
-Prerequisites
--------------
+WSL Ubuntu
+----------
 
-1. Install required packages.
+1. Install required packages::
 
-        a. WSL Ubuntu::
-
-                sudo apt install build-essential qemu-system virt-manager \
-                bridge-utils virtiofsd zip unzip
+        sudo apt install qemu-system virt-manager bridge-utils virtiofsd
 
 2. Download the latest Debian 12 iso::
 

@@ -54,10 +54,6 @@ highlight_language = 'none'
 html_theme = 'alabaster'
 
 html_theme_options = {
-    "pre_bg": "#3C3836",
-    "link":   "#D79921",
-    "sidebar_header": "#ebdbb2",
-    "sidebar_link":   "#D79921",
 }
 
 # Add any paths that contain custom static files (such as style sheets) here,
