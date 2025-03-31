@@ -1,3 +1,4 @@
+==========================
 KTMM: TIERED MEMORY MODULE
 ==========================
 
@@ -7,16 +8,16 @@ approach to a dynamic tiering system for memory intensive applications on
 modern server platforms.
 
 
-System Requirements and Installation
-------------------------------------
+Prerequisites & Installation
+----------------------------
 
-Important prerequisite information. Please read these prior to setup. These
-guides will cover what kind of environment is needed to run the module and what
-packages are needed to build and install the module.
+These articles cover information regarding system setups, testing environments,
+and how to install the module.
 
 .. toctree::
         :maxdepth: 1
 
-        usage/requirements
-        usage/vm-setup
-        usage/installation
+        system/requirements
+        system/vm-setup
+        system/wsl-nested-vm
+        system/installation
