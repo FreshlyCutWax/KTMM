@@ -32,6 +32,84 @@
 static struct task_struct *tmem_d_list[MAX_NUMNODES];
 
 
+/**
+ * This is a recreation of the scan_control struct from mm/vmscan.c. All of the
+ * original members of the struct will be present, with possible additions that
+ * should be added to the end to keep the original data alignment as much as
+ * possible.
+ *
+ * We will remove most of the comments for the original members for conciseness.
+ * For any unconventional use or addtitions to the struct, comments will be
+ * added for clarification.
+ */
+struct scan_control {
+	unsigned long nr_to_reclaim;
+	nodemask_t	*nodemask;
+	struct mem_cgroup *target_mem_cgroup;
+	unsigned long	anon_cost;
+	unsigned long	file_cost;
+
+#define DEACTIVATE_ANON 1
+#define DEACTIVATE_FILE 2
+	unsigned int may_deactivate:2;
+	unsigned int force_deactivate:1;
+	unsigned int skipped_deactivate:1;
+	unsigned int may_writepage:1;
+	unsigned int may_unmap:1;
+	unsigned int may_swap:1;
+	unsigned int proactive:1;
+
+	/*
+	 * Cgroup memory below memory.low is protected as long as we
+	 * don't threaten to OOM. If any cgroup is reclaimed at
+	 * reduced force or passed over entirely due to its memory.low
+	 * setting (memcg_low_skipped), and nothing is reclaimed as a
+	 * result, then go back for one more cycle that reclaims the protected
+	 * memory (memcg_low_reclaim) to avert OOM.
+	 */
+	unsigned int memcg_low_reclaim:1;
+	unsigned int memcg_low_skipped:1;
+	unsigned int hibernation_mode:1;
+	unsigned int compaction_ready:1;
+	unsigned int cache_trim_mode:1;
+	unsigned int file_is_tiny:1;
+	unsigned int no_demotion:1;
+
+#ifdef CONFIG_LRU_GEN
+	/* help kswapd make better choices among multiple memcgs */
+	unsigned int memcgs_need_aging:1;
+	unsigned long last_reclaimed;
+#endif
+
+	/* Allocation order */
+	s8 order;
+
+	/* Scan (total_size >> priority) pages at once */
+	s8 priority;
+
+	/* The highest zone to isolate folios for reclaim from */
+	s8 reclaim_idx;
+
+	/* This context's GFP mask */
+	gfp_t gfp_mask;
+
+	unsigned long nr_scanned;
+	unsigned long nr_reclaimed;
+
+	struct {
+		unsigned int dirty;
+		unsigned int unqueued_dirty;
+		unsigned int congested;
+		unsigned int writeback;
+		unsigned int immediate;
+		unsigned int file_taken;
+		unsigned int taken;
+	} nr;
+
+	/* for recording the reclaimed slab by now */
+	struct reclaim_state reclaim_state;
+};
+
 /*****************************************************************************
  * Node Scanning Functions
  *****************************************************************************/

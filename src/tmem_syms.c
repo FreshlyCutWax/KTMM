@@ -2,6 +2,9 @@
  * tmem_syms.c
  *
  * Symbol lookup code for all inaccessible symbols in the kernel.
+ *
+ * This will be mostly used for gaining access to functions that are not
+ * available to modules.
  */
 
 #include <linux/kprobes.h>
@@ -21,10 +24,6 @@ typedef struct mem_cgroup *(*mem_cgroup_iter_t)(
 
 /**
  * Create instances of our "hidden" kernel symbols here.
- *
- * List currently includes:
- * 	- kallsyms_lookup_name
- * 	- mem_cgroup_iter
  */
 static kallsyms_lookup_name_t symbol_lookup;	//kallsyms_lookup_name
 static mem_cgroup_iter_t cgroup_iter;		//mem_cgroup_iter
@@ -47,8 +46,7 @@ static struct kprobe kp_symslookup = {
  * and structures for the module.
  *
  * A kprobe is first used to obtain kallsyms_lookup_name, then subsequent
- * functions and structures can be reconstructed by looking up symbols
- * by name.
+ * functions can be reconstructed by looking up symbols by name.
  *
  * Reconstructions made in this function should not be used directly
  * outside this portion of the module. Wrappers should be made available
