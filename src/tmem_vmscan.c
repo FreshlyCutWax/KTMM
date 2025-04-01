@@ -21,6 +21,7 @@
 #include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
+#include <linux/swap.h>
 
 #include "tmem_syms.h"
 #include "tmem_vmscan.h"
@@ -236,8 +237,11 @@ static void scan_node(pg_data_t *pgdat, int nid)
  */
 static int tmemd(void *p) 
 {
-	pg_data_t *pgdat;	// struct pglist_data (node)
 	int nid; 	  	// node ID (also in pglist_data as node_id)
+	pg_data_t *pgdat;	// struct pglist_data (node)
+	struct task_struct *tsk = current;
+
+	pr_info("tmemd recently used cpu: %d", tsk->recent_used_cpu);
 	
 	pgdat = (pg_data_t *)p;
 	nid = pgdat->node_id;
