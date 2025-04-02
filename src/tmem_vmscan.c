@@ -33,6 +33,7 @@
 // Temporary list to hold references to tmem daemons.
 // Should replace kswapd task_struct in pglist_data
 static struct task_struct *tmemd_list[MAX_NUMNODES];
+static wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
 
 /**
@@ -225,20 +226,20 @@ static void scan_node(pg_data_t *pgdat, int nid)
 }
 
 
-static void tmemd_try_to_sleep(pg_data_t *pgdat, wait_queue_head_t *wq)
+static void tmemd_try_to_sleep(pg_data_t *pgdat)
 {
-	//int nid = READ_ONCE(pgdat->node_id);
+	int nid = READ_ONCE(pgdat->node_id);
 
 	DEFINE_WAIT(wait);
 
 	if (freezing(current) || kthread_should_stop())
 		return;
 	
-	prepare_to_wait(wq, &wait, TASK_INTERRUPTIBLE);
+	prepare_to_wait(&tmemd_wait[nid], &wait, TASK_INTERRUPTIBLE);
 	if (kthread_should_stop())
 		schedule_timeout(HZ);
 
-	finish_wait(wq, &wait);
+	finish_wait(&tmemd_wait[nid], &wait);
 }
 
 
@@ -256,7 +257,6 @@ static int tmemd(void *p)
 {
 	int nid;
 	pg_data_t *pgdat;
-	wait_queue_head_t wq;
 	//unsigned int alloc_order, reclaim_order;
 	unsigned int highest_zoneidx;
 	//struct zone_type current_idx;
@@ -267,7 +267,6 @@ static int tmemd(void *p)
 	nid = pgdat->node_id;
 	cpumask = cpumask_of_node(pgdat->node_id);
 	highest_zoneidx = MAX_NR_ZONES - 1;
-	init_waitqueue_head(&wq);
 
 	pr_info("[tmem debug] Entered tmemd function for node %d\n", nid);
 
@@ -304,7 +303,7 @@ static int tmemd(void *p)
 		//sleep function here	
 		//msleep(10000);
 		pr_info("[tmem debug] tmemd on node %d trying to sleep\n", nid);
-		tmemd_try_to_sleep(pgdat, &wq);
+		tmemd_try_to_sleep(pgdat);
 		
 		/* 
 		 * We might need to read new allocation and reclaim orders
@@ -346,9 +345,12 @@ void tmemd_start_available(void)
 	
 	for_each_online_node(nid)
 	{
+		wait_queue_head_t wq;
 		pg_data_t *pgdat = NODE_DATA(nid);
 		
         	tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
+		init_waitqueue_head(&wq);
+		tmemd_wait[nid] = wq;
 	}
 }
 
