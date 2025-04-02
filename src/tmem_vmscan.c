@@ -345,9 +345,14 @@ void tmemd_start_available(void)
 	
 	for_each_online_node(nid)
 	{
+		wait_queue_head_t wait_queue;
 		pg_data_t *pgdat = NODE_DATA(nid);
 		
         	tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
+		
+		// init wait queue
+		init_waitqueue_head(&wait_queue);
+		tmemd_wait[nid] = wait_queue;
 	}
 }
 
