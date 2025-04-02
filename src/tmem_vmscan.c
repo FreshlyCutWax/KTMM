@@ -23,6 +23,7 @@
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/swap.h>
+#include <linux/wait.h>
 
 #include "tmem_syms.h"
 #include "tmem_vmscan.h"
@@ -31,7 +32,8 @@
 
 // Temporary list to hold references to tmem daemons.
 // Should replace kswapd task_struct in pglist_data
-static struct task_struct *tmem_d_list[MAX_NUMNODES];
+static struct task_struct *tmemd_list[MAX_NUMNODES];
+static wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
 
 /**
@@ -224,6 +226,23 @@ static void scan_node(pg_data_t *pgdat, int nid)
 }
 
 
+static void tmemd_try_to_sleep(pg_data_t *pgdat)
+{
+	int nid = READ_ONCE(pgdat->node_id);
+
+	DEFINE_WAIT(wait);
+
+	if (freezing(current) || kthread_should_stop())
+		return;
+	
+	prepare_to_wait(&tmemd_wait[nid], &wait, TASK_INTERRUPTIBLE);
+	if (kthread_should_stop())
+		schedule_timeout(HZ);
+
+	finish_wait(&tmemd_wait[nid], &wait);
+}
+
+
 /**
  * tmemd - page promotion daemon function
  *
@@ -233,8 +252,6 @@ static void scan_node(pg_data_t *pgdat, int nid)
  * that is found in the pglist_data pgdat struct.
  * Currently, we only store it in our own local array
  * of type task_struct.
- *
- * struct pglist_data (src/linux/mmzone.h)
  */
 static int tmemd(void *p) 
 {
@@ -280,9 +297,10 @@ static int tmemd(void *p)
 
 		//alloc_order = reclaim_order = READ_ONCE(pgdat->kswapd_order);
 
-tmemd_try_sleep:
+//tmemd_try_sleep:
 		//sleep function here	
-		msleep(10000);
+		//msleep(10000);
+		tmemd_try_to_sleep(pgdat);
 		
 		/* 
 		 * We might need to read new allocation and reclaim orders
@@ -326,7 +344,7 @@ void tmemd_start_available(void)
 	{
 		pg_data_t *pgdat = NODE_DATA(nid);
 		
-        	tmem_d_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
+        	tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
 	}
 }
 
@@ -341,6 +359,6 @@ void tmemd_stop_all(void)
 
     for_each_online_node(nid)
     {
-        kthread_stop(tmem_d_list[nid]);
+        kthread_stop(tmemd_list[nid]);
     }
 }
