@@ -211,7 +211,7 @@ static void scan_node(pg_data_t *pgdat, int nid)
 		list = &lruvec->lists[lru];
 		
 		// for debug purposes, change later
-		pr_info("Scanning evictable LRU list: %d\n", lru);
+		pr_info("Scanning evictable LRU list on node %d: %d\n", nid, lru);
 		
 		spin_lock_irqsave(&lruvec->lru_lock, flags);
 		
@@ -268,6 +268,8 @@ static int tmemd(void *p)
 	cpumask = cpumask_of_node(pgdat->node_id);
 	highest_zoneidx = MAX_NR_ZONES - 1;
 
+	pr_info("[tmem debug] Entered tmemd function for node %d\n", nid);
+
 	// Only allow node's CPUs to run this task
 	if(!cpumask_empty(cpumask))
 		set_cpus_allowed_ptr(tsk, cpumask);
@@ -300,6 +302,7 @@ static int tmemd(void *p)
 //tmemd_try_sleep:
 		//sleep function here	
 		//msleep(10000);
+		pr_info("[tmem debug] tmemd on node %d trying to sleep\n", nid);
 		tmemd_try_to_sleep(pgdat);
 		
 		/* 
