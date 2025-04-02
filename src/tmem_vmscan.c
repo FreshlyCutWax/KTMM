@@ -7,6 +7,7 @@
 #include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
+#include <linux/freezer.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/kthread.h>
@@ -237,26 +238,68 @@ static void scan_node(pg_data_t *pgdat, int nid)
  */
 static int tmemd(void *p) 
 {
-	int nid; 	  	// node ID (also in pglist_data as node_id)
-	pg_data_t *pgdat;	// struct pglist_data (node)
+	int nid;
+	pg_data_t *pgdat;
+	//unsigned int alloc_order, reclaim_order;
+	unsigned int highest_zoneidx;
+	//struct zone_type current_idx;
 	struct task_struct *tsk = current;
+	const struct cpumask *cpumask;
 
-	pr_info("tmemd recently used cpu: %d", tsk->recent_used_cpu);
-	
 	pgdat = (pg_data_t *)p;
 	nid = pgdat->node_id;
+	cpumask = cpumask_of_node(pgdat->node_id);
+	highest_zoneidx = MAX_NR_ZONES - 1;
+
+	// Only allow node's CPUs to run this task
+	if(!cpumask_empty(cpumask))
+		set_cpus_allowed_ptr(tsk, cpumask);
+
+	/*
+	 * Tell MM that we are a memory allocator, and that we are actually
+	 * kswapd. We are also set to suspend as needed.
+	 *
+	 * Flags are located in include/sched.h for more info.
+	 */
+	tsk->flags |= PF_MEMALLOC | PF_KSWAPD;
+	set_freezable();
+
+	/*
+	 * Before we enter into the loop, we want to wait here until we can catch
+	 * kswapd from the wait queue and put it in our wait queue. Then, we can
+	 * inherit kswapd's reclaim order and highest zone.
+	 */
 	
-	// Loop every few seconds and scan the node's LRU lists.
-	// If the thread is signaled to stop, we will exit.
+	/*
+	 * Loop every few seconds and scan the node's LRU lists.
+	 * If the thread is signaled to stop, we will exit.
+	 */
 	for ( ; ; )
 	{
-		scan_node(pgdat, nid);
+		bool ret;
+
+		//alloc_order = reclaim_order = READ_ONCE(pgdat->kswapd_order);
+
+tmemd_try_sleep:
+		//sleep function here	
+		msleep(10000);
 		
+		/* 
+		 * We might need to read new allocation and reclaim orders
+		 * depending on future iterations of tmemd_try_to_sleep
+		 * function, so I'm leaving a note here.
+		 */
+		
+		ret = try_to_freeze();
 		if(kthread_should_stop())
 			break;
 		
-		msleep(10000);
+		if (ret) continue;
+		
+		scan_node(pgdat, nid);
 	}
+
+	tsk->flags &= ~(PF_MEMALLOC | PF_KSWAPD);
 	
 	return 0;
 }
