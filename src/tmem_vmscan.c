@@ -345,12 +345,12 @@ void tmemd_start_available(void)
 	
 	for_each_online_node(nid)
 	{
-		wait_queue_head_t wq;
+		//wait_queue_head_t wq;
+		DECLARE_WAIT_QUEUE_HEAD(tmem_wq);
 		pg_data_t *pgdat = NODE_DATA(nid);
 		
         	tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
-		init_waitqueue_head(&wq);
-		tmemd_wait[nid] = wq;
+		tmemd_wait[nid] = tmem_wq;
 	}
 }
 
