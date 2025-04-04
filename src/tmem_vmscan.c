@@ -28,12 +28,10 @@
 #include "tmem_syms.h"
 #include "tmem_vmscan.h"
 
-#define TMEM_MAX_QUEUE 8
-
 // Temporary list to hold references to tmem daemons.
 // Should replace kswapd task_struct in pglist_data
 static struct task_struct *tmemd_list[MAX_NUMNODES];
-wait_queue_head_t tmemd_wait[TMEM_MAX_QUEUE];
+wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
 
 /**
@@ -344,7 +342,7 @@ void tmemd_start_available(void)
 	int i;
 	int nid;
 
-	for (i = 0; i < TMEM_MAX_QUEUE; i++)
+	for (i = 0; i < MAX_NUMNODES; i++)
 		init_waitqueue_head(&tmemd_wait[i]);
 	
 	for_each_online_node(nid)
