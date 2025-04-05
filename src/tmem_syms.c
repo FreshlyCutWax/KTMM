@@ -7,7 +7,10 @@
  * available to modules.
  */
 
+#include <linux/ftrace.h>
+#include <linux/kernel.h>
 #include <linux/kprobes.h>
+#include <linux/linkage.h>
 #include <linux/memcontrol.h>
 
 #include "tmem_syms.h"
@@ -25,19 +28,99 @@ typedef struct mem_cgroup *(*mem_cgroup_iter_t)(
 /**
  * Create instances of our "hidden" kernel symbols here.
  */
-static kallsyms_lookup_name_t symbol_lookup;	//kallsyms_lookup_name
-static mem_cgroup_iter_t cgroup_iter;		//mem_cgroup_iter
+static kallsyms_lookup_name_t symbol_lookup_name;	//kallsyms_lookup_name
+static mem_cgroup_iter_t cgroup_iter;			//mem_cgroup_iter
 
 
-/**
- * kp_symslookup - kprobe for acquiring kallsyms_lookup_name
- *
- * When this is registered, it will establish a break point
- * in the kernel where this symbol is located.
- */
-static struct kprobe kp_symslookup = {
-	.symbol_name = "kallsyms_lookup_name"
+int init_symbol_lookup() 
+{
+
+	int ret = 0;
+	
+	struct kprobe kp = {
+		.symbol_name = "kallsyms_lookup_name"
+	};
+	
+	register_kprobe(&kp);
+	symbol_lookup_name = (kallsyms_lookup_name_t) kp.addr;
+	unregister_kprobe(&kp);
+
+	if (!symbol_lookup) ret = -EFAULT;
+
+	return ret;
+}
+
+
+struct tmem_hook {
+	const char *name;
+	void *callback;
+	void *kfunct;
+
+	unsigned long kaddr;
+	struct ftract_ops ops;
+	struct ftrace_regs regs; 
 };
+
+
+/*
+ * 
+ */
+static int register_hook(struct tmem_hook *hook) 
+{
+	int err;
+
+	hook->kaddr = symbol_lookup(hook->name);
+
+	if (!hook->kaddr)
+		return -EFAULT;
+	
+	/*
+	 * We want to effectively skip over the mcount instruction so we don't
+	 * accidently call it again if the wrapper ends up calling the original
+	 * function.
+	 */
+	*((unsigned long *) hook->kfunct) = hook->kaddr + MCOUNT_INSN_SIZE;
+	
+	hook->ops.func = wrap_hook;
+	hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
+
+	err = ftrace_set_filter_ip(&hook->ops, hook->kaddr, 0, 0);
+	if (err)
+		return err;
+
+	err = register_ftrace_function(&hook->ops);
+	if (err) {
+		ftrace_set_filter_ip(&hook->ops, hook->kaddr, 1, 0);
+		
+		return err;
+	}
+
+	return 0;
+}
+
+
+static int unregister_hook(struct tmem_hook *hook)
+{
+	int ret;
+
+	ret = unregister_ftrace_function(&hook->ops);
+	ftrace_set_filter_ip(&hook->ops, hook->kaddr, 1, 0);
+
+	// can be an error
+	return ret;
+}
+
+
+static void notrace wrap_hook(unsigned long ip,
+				unsigned long parent_ip,
+				struct ftrace_ops *ops,
+				struct pt_regs *regs)
+{
+	struct ftrace_hook *hook = container_of(ops, struct tmem_hook, ops);
+
+	regs->ip = (unsigned long) hook->callback;
+}
+
 
 /**
  * This will use kallsyms_lookup_name to acquire and establish needed
@@ -52,15 +135,10 @@ static struct kprobe kp_symslookup = {
  * outside this portion of the module. Wrappers should be made available
  * to be used by the rest of the module.
  */
-bool register_module_symbols() {
+bool register_module_symbols() 
+{
 	unsigned long addr;
 
-	// acquire kallsyms_lookup_name w/ kprobe
-	register_kprobe(&kp_symslookup);
-	symbol_lookup = (kallsyms_lookup_name_t) kp_symslookup.addr;
-	unregister_kprobe(&kp_symslookup);
-	
-	
 	// register mem_cgroup_iter
 	addr = symbol_lookup("mem_cgroup_iter");
 	if(!addr) goto failure;
