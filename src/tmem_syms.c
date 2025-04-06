@@ -15,6 +15,9 @@
 
 #include "tmem_syms.h"
 
+// this is arbitrary, maybe change later?
+#define TMEM_BUFSIZE_MAX 128
+
 // kallsyms_lookup_name
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *symbol_name);
 
@@ -121,6 +124,58 @@ static int unregister_hook(struct tmem_hook *hook)
 
 	// can be an error
 	return ret;
+}
+
+
+struct tmem_hook_buffer {
+	bool err;
+	size_t len;
+	struct tmem_hook buf[TMEM_BUFSIZE_MAX];
+};
+
+
+int uninstall_hooks(struct tmem_hook_buffer *buf)
+{
+	bool err;
+	int ret;
+	size_t i;
+	size_t stop = buf->len;
+	struct tmem_hook *hook;
+
+	for (i = 0; i < stop; i++) {
+		hook = &buf->buf[i];
+		ret = unregister_hook(hook);
+
+		if (ret) err = true;
+	}
+
+	if (err) return -EFAULT;
+
+	return 0;
+}
+
+
+int install_hooks(struct tmem_hook_buffer *buf)
+{
+	int err;
+	size_t i;
+	size_t stop = buf->len;
+	struct tmem_hook *hook;
+
+	for (i = 0; i < stop; i++) {
+		hook = &buf->buf[i];
+		err = register_hook(hook);
+
+		if (err) goto hook_install_error;
+	}
+
+	return 0;
+
+hook_install_error:
+	buf->err = true;
+	uninstall_hooks(buf);
+	
+	return err;
 }
 
 
