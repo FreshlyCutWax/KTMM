@@ -28,14 +28,13 @@ typedef struct mem_cgroup *(*mem_cgroup_iter_t)(
 /**
  * Create instances of our "hidden" kernel symbols here.
  */
-static kallsyms_lookup_name_t symbol_lookup_name;	//kallsyms_lookup_name
 static mem_cgroup_iter_t cgroup_iter;			//mem_cgroup_iter
 
 
-int init_symbol_lookup() 
+int symbol_lookup(const char *name) 
 {
-
 	int ret = 0;
+	kallsyms_lookup_name_t symbol_lookup_name;
 	
 	struct kprobe kp = {
 		.symbol_name = "kallsyms_lookup_name"
@@ -45,21 +44,33 @@ int init_symbol_lookup()
 	symbol_lookup_name = (kallsyms_lookup_name_t) kp.addr;
 	unregister_kprobe(&kp);
 
-	if (!symbol_lookup) ret = -EFAULT;
+	if (!symbol_lookup_name) ret = -EFAULT;
 
 	return ret;
 }
 
 
 struct tmem_hook {
-	const char *name;
+	const char *kfunc_name;
 	void *callback;
-	void *kfunct;
 
-	unsigned long kaddr;
-	struct ftract_ops ops;
-	struct ftrace_regs regs; 
+	void *kfunc;
+	unsigned long kfunc_addr;
+	unsigned long callback_addr;
+	struct ftrace_ops ops;
 };
+
+
+static void notrace wrap_hook(unsigned long ip,
+				unsigned long parent_ip,
+				struct ftrace_ops *ops,
+				struct ftrace_regs *regs)
+{
+	struct tmem_hook *hook = container_of(ops, struct tmem_hook, ops);
+
+	ftrace_instruction_pointer_set(regs, hook->callback_addr);
+	//regs->ip = (unsigned long) hook->callback;
+}
 
 
 /*
@@ -69,9 +80,11 @@ static int register_hook(struct tmem_hook *hook)
 {
 	int err;
 
-	hook->kaddr = symbol_lookup(hook->name);
+	hook->callback_addr = (unsigned long) hook->callback;
 
-	if (!hook->kaddr)
+	hook->kfunc_addr = symbol_lookup(hook->kfunc_name);
+
+	if (!hook->kfunc_addr)
 		return -EFAULT;
 	
 	/*
@@ -79,18 +92,18 @@ static int register_hook(struct tmem_hook *hook)
 	 * accidently call it again if the wrapper ends up calling the original
 	 * function.
 	 */
-	*((unsigned long *) hook->kfunct) = hook->kaddr + MCOUNT_INSN_SIZE;
+	hook->kfunc = (void *) (hook->kfunc_addr + MCOUNT_INSN_SIZE);
 	
 	hook->ops.func = wrap_hook;
 	hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
 
-	err = ftrace_set_filter_ip(&hook->ops, hook->kaddr, 0, 0);
+	err = ftrace_set_filter_ip(&hook->ops, hook->kfunc_addr, 0, 0);
 	if (err)
 		return err;
 
 	err = register_ftrace_function(&hook->ops);
 	if (err) {
-		ftrace_set_filter_ip(&hook->ops, hook->kaddr, 1, 0);
+		ftrace_set_filter_ip(&hook->ops, hook->kfunc_addr, 1, 0);
 		
 		return err;
 	}
@@ -104,21 +117,10 @@ static int unregister_hook(struct tmem_hook *hook)
 	int ret;
 
 	ret = unregister_ftrace_function(&hook->ops);
-	ftrace_set_filter_ip(&hook->ops, hook->kaddr, 1, 0);
+	ftrace_set_filter_ip(&hook->ops, hook->kfunc_addr, 1, 0);
 
 	// can be an error
 	return ret;
-}
-
-
-static void notrace wrap_hook(unsigned long ip,
-				unsigned long parent_ip,
-				struct ftrace_ops *ops,
-				struct pt_regs *regs)
-{
-	struct ftrace_hook *hook = container_of(ops, struct tmem_hook, ops);
-
-	regs->ip = (unsigned long) hook->callback;
 }
 
 

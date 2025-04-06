@@ -4,6 +4,8 @@
 
 #include <linux/memcontrol.h>
 
+int symbol_lookup(const char *name);
+
 /**
  * register_module_symbols - register hidden kernel symbols
  *
