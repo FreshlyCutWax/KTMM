@@ -17,12 +17,14 @@ MODULE_DESCRIPTION("Tiered memory module.");
 
 
 static int __init tmem_init(void) {
+	int ret;
+
 	pr_info( "tmem-csc450 module initializing..\n" );
 	
 	if(register_module_symbols())
 	{
-		tmemd_start_available();
-		return 0;
+		ret = tmemd_start_available();
+		return ret;
 	}
 	
 	// return error for invalid memory address

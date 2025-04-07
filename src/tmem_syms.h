@@ -8,7 +8,7 @@
 // this is arbitrary, maybe change later?
 #define TMEM_BUFSIZE_MAX 128
 
-int symbol_lookup(const char *name);
+unsigned long symbol_lookup(const char *name);
 
 /**
  * Do not use this directly. Use the macro to create a hook instead.
@@ -24,7 +24,6 @@ struct tmem_hook {
 };
 
 struct tmem_hook_buffer {
-	bool err;
 	size_t len;
 	struct tmem_hook buf[TMEM_BUFSIZE_MAX];
 };
@@ -35,23 +34,19 @@ struct tmem_hook_buffer {
  *
  * Should be of type struct tmem_hook.
  */
-#define HOOK(name, callback)		\
-	{				\
-		.kfunc_name = (name),	\
-		.callback = (callback),	\
+#define HOOK(_name, _callback)			\
+	{					\
+		.kfunc_name = (_name),		\
+		.callback = (_callback),	\
 	}
 
 /**
- * @hooks: array of the hooks to add to the buffer.
+ * @arr: buf member (array) of struct tmem_hook_buffer
  *
  * Should be of type struct tmem_hook_buffer.
  */
-#define INIT_HOOK_BUFFER(hooks)							\
-	{									\
-		.err = false,							\
-		.len = (sizeof(hooks) > 0) ? sizeof(hooks)/sizeof(hooks[0]) : 0 \
-		.buf = hooks,							\
-	}
+#define INIT_BUF_LEN(arr) \
+	(sizeof(arr) > 0) ? sizeof(arr)/sizeof(arr[0]) : 0
 
 int uninstall_hooks(struct tmem_hook_buffer *buf);
 
@@ -73,5 +68,8 @@ bool register_module_symbols(void);
 struct mem_cgroup *tmem_cgroup_iter(struct mem_cgroup *root,
 			struct mem_cgroup *prev,
 			struct mem_cgroup_reclaim_cookie *reclaim);
+
+
+int tmem_balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx);
 
 #endif /* TMEM_SYMS_HEADER_H */

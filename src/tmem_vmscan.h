@@ -5,7 +5,7 @@
 /**
  * tmem_start_available - start tmem daemons on all online nodes
  */
-void tmemd_start_available(void);
+int tmemd_start_available(void);
 
 /**
  * tmemd_stop_all - stop all tmem daemons on all online nodes

@@ -11,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/kthread.h>
+//#include <linux/linkage.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/memcontrol.h>
@@ -31,8 +32,7 @@
 // Temporary list to hold references to tmem daemons.
 // Should replace kswapd task_struct in pglist_data
 static struct task_struct *tmemd_list[MAX_NUMNODES];
-wait_queue_head_t tmemd_wait[MAX_NUMNODES];
-
+//wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
 /**
  * This is a recreation of the scan_control struct from mm/vmscan.c. All of the
@@ -209,7 +209,7 @@ static void scan_node(pg_data_t *pgdat, int nid)
 		list = &lruvec->lists[lru];
 		
 		// for debug purposes, change later
-		pr_info("Scanning evictable LRU list on node %d: %d\n", nid, lru);
+		//pr_info("Scanning evictable LRU list on node %d: %d\n", nid, lru);
 		
 		spin_lock_irqsave(&lruvec->lru_lock, flags);
 		
@@ -219,11 +219,11 @@ static void scan_node(pg_data_t *pgdat, int nid)
 		spin_unlock_irqrestore(&lruvec->lru_lock, flags);
 		
 		// for debug purpses, change later
-		pr_info("Reference count: %d\n", ref_count);
+		//pr_info("Reference count: %d\n", ref_count);
 	}
 }
 
-
+/*
 static void tmemd_try_to_sleep(pg_data_t *pgdat)
 {
 	int nid = READ_ONCE(pgdat->node_id);
@@ -239,7 +239,7 @@ static void tmemd_try_to_sleep(pg_data_t *pgdat)
 
 	finish_wait(&tmemd_wait[nid], &wait);
 }
-
+*/
 
 /**
  * tmemd - page promotion daemon function
@@ -279,7 +279,7 @@ static int tmemd(void *p)
 	 * Flags are located in include/sched.h for more info.
 	 */
 	tsk->flags |= PF_MEMALLOC | PF_KSWAPD;
-	set_freezable();
+	//set_freezable();
 
 	/*
 	 * Before we enter into the loop, we want to wait here until we can catch
@@ -293,15 +293,15 @@ static int tmemd(void *p)
 	 */
 	for ( ; ; )
 	{
-		bool ret;
+		//bool ret;
 
 		//alloc_order = reclaim_order = READ_ONCE(pgdat->kswapd_order);
 
 //tmemd_try_sleep:
 		//sleep function here	
-		//msleep(10000);
-		pr_info("[tmem debug] tmemd on node %d trying to sleep\n", nid);
-		tmemd_try_to_sleep(pgdat);
+		msleep(1000);
+		//pr_info("[tmem debug] tmemd on node %d trying to sleep\n", nid);
+		//tmemd_try_to_sleep(pgdat);
 		
 		/* 
 		 * We might need to read new allocation and reclaim orders
@@ -309,11 +309,11 @@ static int tmemd(void *p)
 		 * function, so I'm leaving a note here.
 		 */
 		
-		ret = try_to_freeze();
+		//ret = try_to_freeze();
 		if(kthread_should_stop())
 			break;
 		
-		if (ret) continue;
+		//if (ret) continue;
 		
 		scan_node(pgdat, nid);
 	}
@@ -322,6 +322,18 @@ static int tmemd(void *p)
 	
 	return 0;
 }
+
+
+/*
+ * EXPERIMENT
+ */
+struct tmem_hook_buffer vmhooks = {
+	.buf = { 
+		HOOK("balance_pgdat", &tmem_balance_pgdat),
+	},
+};
+
+
 
 
 /**
@@ -337,13 +349,27 @@ static int tmemd(void *p)
  *
  * kthread_run [src/include/kthread.h]
  */
-void tmemd_start_available(void) 
+int tmemd_start_available(void) 
 {
 	int i;
 	int nid;
+	int err;
+	
+	//vmhooks.len = INIT_BUF_LEN(vmhooks.buf);
+	vmhooks.len = 1;
 
-	for (i = 0; i < MAX_NUMNODES; i++)
-		init_waitqueue_head(&tmemd_wait[i]);
+	pr_info("[tmem debug] vmhooks length: %lu", vmhooks.len);
+
+	err = install_hooks(&vmhooks);
+	if (err) {
+		pr_info("[tmem] failed to install hooks");
+		return err;
+	}
+
+	pr_info("[tmem debug] hooks installed!");
+
+	//for (i = 0; i < MAX_NUMNODES; i++)
+	//	init_waitqueue_head(&tmemd_wait[i]);
 	
 	for_each_online_node(nid)
 	{
@@ -351,6 +377,8 @@ void tmemd_start_available(void)
 		
         	tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
 	}
+
+	return 0;
 }
 
 
@@ -361,9 +389,14 @@ void tmemd_start_available(void)
 void tmemd_stop_all(void)
 {
     int nid;
+    int ret;
 
     for_each_online_node(nid)
     {
         kthread_stop(tmemd_list[nid]);
     }
+
+    ret = uninstall_hooks(&vmhooks);
+    if (ret) pr_info("[tmem debug] hooks did not uninstall correctly");
 }
+
