@@ -2,9 +2,46 @@
 #ifndef TMEM_SYMS_HEADER_H
 #define TMEM_SYMS_HEADER_H
 
+#include <linux/ftrace.h>
 #include <linux/memcontrol.h>
 
+// this is arbitrary, maybe change later?
+#define TMEM_BUFSIZE_MAX 128
+
 int symbol_lookup(const char *name);
+
+/**
+ * Do not use this directly. Use the macro to create a hook instead.
+ */
+struct tmem_hook {
+	const char *kfunc_name;
+	void *callback;
+
+	void *kfunc;
+	unsigned long kfunc_addr;
+	unsigned long callback_addr;
+	struct ftrace_ops ops;
+};
+
+struct tmem_hook_buffer {
+	bool err;
+	size_t len;
+	struct tmem_hook buf[TMEM_BUFSIZE_MAX];
+};
+
+/**
+ * @name: 	kernel function symbol name
+ * @callback:	function to call when mcount is executed
+ */
+#define HOOK(name,callback)		\
+	{				\
+		.kfunc_name = (name),	\
+		.callback = (callback),	\
+	}
+
+int uninstall_hooks(struct tmem_hook_buffer *buf);
+
+int install_hooks(struct tmem_hook_buffer *buf);
 
 /**
  * register_module_symbols - register hidden kernel symbols

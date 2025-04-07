@@ -15,9 +15,6 @@
 
 #include "tmem_syms.h"
 
-// this is arbitrary, maybe change later?
-#define TMEM_BUFSIZE_MAX 128
-
 // kallsyms_lookup_name
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *symbol_name);
 
@@ -51,17 +48,6 @@ int symbol_lookup(const char *name)
 
 	return ret;
 }
-
-
-struct tmem_hook {
-	const char *kfunc_name;
-	void *callback;
-
-	void *kfunc;
-	unsigned long kfunc_addr;
-	unsigned long callback_addr;
-	struct ftrace_ops ops;
-};
 
 
 static void notrace wrap_hook(unsigned long ip,
@@ -125,13 +111,6 @@ static int unregister_hook(struct tmem_hook *hook)
 	// can be an error
 	return ret;
 }
-
-
-struct tmem_hook_buffer {
-	bool err;
-	size_t len;
-	struct tmem_hook buf[TMEM_BUFSIZE_MAX];
-};
 
 
 int uninstall_hooks(struct tmem_hook_buffer *buf)
