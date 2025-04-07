@@ -10,7 +10,7 @@
 #include <linux/ftrace.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
-#include <linux/linkage.h>
+//#include <linux/linkage.h>
 #include <linux/memcontrol.h>
 
 #include "tmem_syms.h"
@@ -152,6 +152,7 @@ int install_hooks(struct tmem_hook_buffer *buf)
 
 hook_install_error:
 	buf->err = true;
+	buf->len = i+1;
 	uninstall_hooks(buf);
 	
 	return err;

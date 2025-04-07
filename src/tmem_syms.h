@@ -32,11 +32,25 @@ struct tmem_hook_buffer {
 /**
  * @name: 	kernel function symbol name
  * @callback:	function to call when mcount is executed
+ *
+ * Should be of type struct tmem_hook.
  */
-#define HOOK(name,callback)		\
+#define HOOK(name, callback)		\
 	{				\
 		.kfunc_name = (name),	\
 		.callback = (callback),	\
+	}
+
+/**
+ * @hooks: array of the hooks to add to the buffer.
+ *
+ * Should be of type struct tmem_hook_buffer.
+ */
+#define INIT_HOOK_BUFFER(hooks)							\
+	{									\
+		.err = false,							\
+		.len = (sizeof(hooks) > 0) ? sizeof(hooks)/sizeof(hooks[0]) : 0 \
+		.buf = hooks,							\
 	}
 
 int uninstall_hooks(struct tmem_hook_buffer *buf);
