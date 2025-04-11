@@ -5,9 +5,6 @@
  */
 
 #define pr_fmt(fmt) "[ KTMM Mod ] " fmt
-#define KERN_VER_MAJOR 6
-#define KERN_VER_MINOR 1
-#define KERN_VER_PATCH 0
 
 /*
  * KERNEL
@@ -21,8 +18,8 @@
 /*
  * MODULE
  */
-#include "ktmm_hook.h"
-//#include "ktmm_vmscan.h"
+//#include "ktmm_hook.h"
+#include "ktmm_vmscan.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jared Draper, Josh Borthick, Grant Wilke, Camilo Palomino");
@@ -32,16 +29,12 @@ MODULE_DESCRIPTION("Tiered Memory Module.");
 static int __init tmem_init(void) {
 	int ret;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,1,0)
 	pr_info("Module initializing..\n");
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(KERN_VER_MAJOR, \
-					KERN_VER_MINOR, \
-					KERN_VER_PATCH) 
-	ret = 0;
-	
+	ret = tmemd_start_available();
 #else
+	ret = -EFAULT;
 	pr_info("Minimum kernel version not met.");
-	ret = -EINVAL;
 #endif
 
 	return ret;
@@ -50,6 +43,7 @@ static int __init tmem_init(void) {
 
 static void __exit tmem_exit(void) {
 	pr_info("Module exiting..\n");
+	tmemd_stop_all();
 }
 
 

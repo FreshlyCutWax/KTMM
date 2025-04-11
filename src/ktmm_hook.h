@@ -39,7 +39,7 @@ struct ktmm_hook {
  *
  * To be used for initializing struct ktmm_hook.
  */
-#define HOOK(name, mfunc, kfunc, import_only)	\
+#define HOOK(name, mfunc, kfunc)		\
 	{					\
 		.symbol_name = (name),		\
 		.module_function = (mfunc),	\
