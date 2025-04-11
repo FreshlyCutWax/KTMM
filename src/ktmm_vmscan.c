@@ -31,56 +31,12 @@
 #include "ktmm_vmscan.h"
 
 // Temporary list to hold references to tmem daemons.
-// Should replace kswapd task_struct in pglist_data
+// Replace kswapd task_struct in pglist_data?
 static struct task_struct *tmemd_list[MAX_NUMNODES];
-//wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
-
-/************** IMPORTED/HOOKED PROTOTYPES HERE *******************/
-static struct mem_cgroup *(*pt_mem_cgroup_iter)(struct mem_cgroup *root,
-				struct mem_cgroup *prev,
-				struct mem_cgroup_reclaim_cookie *reclaim);
-
-
-static int (*pt_balance_pgdat)(pg_data_t *pgdat, 
-				int order, 
-				int highest_zoneidx);
-
-
-/******************* HOOK REDEFS HERE *****************************/
-static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
-				struct mem_cgroup *prev,
-				struct mem_cgroup_reclaim_cookie *reclaim)
-{
-	struct mem_cgroup *memcg;
-
-	memcg = pt_mem_cgroup_iter(root, prev, reclaim);
-
-	return memcg;
-}
-
-
-static int ktmm_balance_pgdat(pg_data_t *pgdat,
-				int order,
-				int highest_zoneidx)
-{
-	int ret;
-
-	pr_debug("call to balance_pgdat");
-
-	ret = pt_balance_pgdat(pgdat, order, highest_zoneidx);
-
-	pr_debug("call to balance_pgdat complete");
-
-	return ret;
-}
-
-
-/****************** ADD VMSCAN HOOKS HERE ************************/
-static struct ktmm_hook vmscan_hooks[] = {
-	HOOK("mem_cgroup_iter", ktmm_mem_cgroup_iter, &pt_mem_cgroup_iter),
-	HOOK("balance_pgdat", ktmm_balance_pgdat, &pt_balance_pgdat),
-};
+//Temporary list to hold our wait sleep queues for tmem daemons
+//Replace kswapd kswapd_wait in pglist_data?
+wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
 
 /**
@@ -155,6 +111,93 @@ struct scan_control {
 	struct reclaim_state reclaim_state;
 };
 
+
+/************** IMPORTED/HOOKED PROTOTYPES HERE *******************/
+static struct mem_cgroup *(*pt_mem_cgroup_iter)(struct mem_cgroup *root,
+				struct mem_cgroup *prev,
+				struct mem_cgroup_reclaim_cookie *reclaim);
+
+/* FROM: vmscan.c */
+static int (*pt_balance_pgdat)(pg_data_t *pgdat, 
+				int order, 
+				int highest_zoneidx);
+
+/* FROM: page_alloc.c */
+/*
+void (*pt__fs_reclaim_acquire)(unsigned long ip);
+*/
+
+
+/******************* HOOK REDEFS HERE *****************************/
+static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
+				struct mem_cgroup *prev,
+				struct mem_cgroup_reclaim_cookie *reclaim)
+{
+	struct mem_cgroup *memcg;
+
+	memcg = pt_mem_cgroup_iter(root, prev, reclaim);
+
+	return memcg;
+}
+
+/**
+ * Acquire the lock to reclaim memory.
+ *
+void ktmm__fs_reclaim_acquire(unsigned long ip)
+{
+	pt__fs_reclaim_acquire(ip);
+}
+*/
+
+
+static int ktmm_balance_pgdat(pg_data_t *pgdat,
+				int order,
+				int highest_zoneidx)
+{
+	int ret;
+	
+	/*
+	int i;
+	unsigned long nr_soft_reclaimed;
+	unsigned long nr_soft_scanned;
+	unsigned long pflags;
+	unsigned long nr_boost_reclaim;
+	unsigned long zone_boosts[MAX_NR_ZONES] = { 0, };
+	bool boosted;
+	struct task_struct *tsk = current;
+	struct zone *zone;
+
+	struct scan_control sc = {
+		.nr_to_reclaim = SWAP_CLUSTER_MAX,
+		.priority = DEF_PRIORITY,
+		.may_writepage = !laptop_mode, //do not delay writing to disk
+		.may_unmap = 1,
+		.may_swap = 1,
+		.reclaim_idx = MAX_NR_ZONES - 1,
+		.reclaim_state = tsk->reclaim_state,
+	};
+
+	ktmm__fs_reclaim_acquire(_THIS_IP_);
+	*/
+	
+
+	/*
+	 * Call the real balance_pgdat().
+	 */
+	ret = pt_balance_pgdat(pgdat, order, highest_zoneidx);
+
+	return ret;
+}
+
+
+/****************** ADD VMSCAN HOOKS HERE ************************/
+static struct ktmm_hook vmscan_hooks[] = {
+	HOOK("mem_cgroup_iter", ktmm_mem_cgroup_iter, &pt_mem_cgroup_iter),
+	HOOK("balance_pgdat", ktmm_balance_pgdat, &pt_balance_pgdat),
+	//HOOK("__fs_reclaim_acquire", ktmm__fs_reclaim_acquire, pt__fs_reclaim_acquire),
+};
+
+
 /*****************************************************************************
  * Node Scanning Functions
  *****************************************************************************/
@@ -228,15 +271,12 @@ static unsigned int scan_lru_list(struct list_head *list)
  * struct lru_list, struct lruvec [src/include/mmzone.h]
  * struct mem_cgroup, mem_cgroup_iter() [src/include/memcontrol.h]
  */
-static void scan_node(pg_data_t *pgdat)
+static void scan_node(pg_data_t *pgdat, int nid)
 {
-	int nid;
 	enum lru_list lru;
 	struct mem_cgroup *memcg;
 	struct mem_cgroup *root;
 	struct lruvec *lruvec;
-
-	nid = pgdat->node_id;
 
 	// get memory cgroup for the node
 	// tmem_cgroup_iter() = mem_cgroup_iter()
@@ -269,26 +309,50 @@ static void scan_node(pg_data_t *pgdat)
 	}
 }
 
+/**
+ * Hook prepare_alloc_pages, and call if zone watermark is lower.
+ *
+ * We can get the node id from the zone when either of these are called:
+ *
+ * zone_watermark_fast
+ * zone_watermark_ok
+ */
 /*
-static void tmemd_try_to_sleep(pg_data_t *pgdat)
+void wakeup_tmemd(int nid)
 {
-	int nid = READ_ONCE(pgdat->node_id);
+	//check to make sure tmemd in waiting
+	
+	//if it is waiting, wake up
 
+}
+*/
+
+
+static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
+{
+	long remaining = 0;
 	DEFINE_WAIT(wait);
 
 	if (freezing(current) || kthread_should_stop())
 		return;
 	
 	prepare_to_wait(&tmemd_wait[nid], &wait, TASK_INTERRUPTIBLE);
-	if (kthread_should_stop())
-		schedule_timeout(HZ);
+
+	remaining = schedule_timeout(HZ);
+
+	/*
+	 * If tmemd is interrupted, then we need to come out of sleep and go
+	 * back to scanning and migrating pages between nodes.
+	 */
+	if (!kthread_should_stop() && !remaining) 
+		schedule();
 
 	finish_wait(&tmemd_wait[nid], &wait);
 }
-*/
+
 
 /**
- * tmemd - page promotion daemon function
+ * tmemd - page promotion daemon
  *
  * @p:	pointer to node data struct (pglist_data)
  *
@@ -299,15 +363,10 @@ static void tmemd_try_to_sleep(pg_data_t *pgdat)
  */
 static int tmemd(void *p) 
 {
-	pg_data_t *pgdat;
-	int nid;
-	struct task_struct *tsk;
-	const struct cpumask *cpumask;
-
-	pgdat = (pg_data_t *)p;
-	nid = pgdat->node_id;
-	tsk = current;
-	cpumask = cpumask_of_node(pgdat->node_id);
+	pg_data_t *pgdat = (pg_data_t *)p;
+	int nid = READ_ONCE(pgdat->node_id);
+	struct task_struct *tsk = current;
+	const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
 
 	pr_debug("tmemd started on node %d", nid);
 
@@ -329,13 +388,13 @@ static int tmemd(void *p)
 	 */
 	for ( ; ; )
 	{
-		scan_node(pgdat);
+		scan_node(pgdat, nid);
 
 		if(kthread_should_stop()) break;
 		
-		//sleep function here	
-		msleep(10000);
-		//tmemd_try_to_sleep(pgdat);
+//tmemd_try_sleep:
+		//msleep(10000);
+		tmemd_try_to_sleep(pgdat, nid);
 		
 	}
 
@@ -343,6 +402,24 @@ static int tmemd(void *p)
 	
 	return 0;
 }
+
+
+/*
+int kswapd_convert_available(void)
+{
+	int ret;
+
+	ret = install_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
+
+	return ret;
+}
+
+
+void kswapd_revert_all(void)
+{
+    uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
+}
+*/
 
 
 /**
@@ -360,13 +437,15 @@ static int tmemd(void *p)
  */
 int tmemd_start_available(void) 
 {
+	int i;
 	int nid;
 	int ret;
 
 	pr_debug("starting tmemd on available nodes");
 	
-	//for (i = 0; i < MAX_NUMNODES; i++)
-	//	init_waitqueue_head(&tmemd_wait[i]);
+	/* initialize wait queues for sleeping */
+	for (i = 0; i < MAX_NUMNODES; i++)
+		init_waitqueue_head(&tmemd_wait[i]);
 	
 	ret = install_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 	
