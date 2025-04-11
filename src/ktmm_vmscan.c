@@ -30,9 +30,14 @@
 #include "ktmm_hook.h"
 #include "ktmm_vmscan.h"
 
+#define TMEMD_GFP_FLAGS GFP_NOIO
+
 // Temporary list to hold references to tmem daemons.
 // Replace kswapd task_struct in pglist_data?
 static struct task_struct *tmemd_list[MAX_NUMNODES];
+
+// watermark watchdog
+static struct task_struct *wd;
 
 //Temporary list to hold our wait sleep queues for tmem daemons
 //Replace kswapd kswapd_wait in pglist_data?
@@ -128,6 +133,12 @@ void (*pt__fs_reclaim_acquire)(unsigned long ip);
 */
 
 
+static bool (*pt_zone_watermark_ok_safe)(struct zone *z,
+					unsigned int order,
+					unsigned long mark,
+					int highest_zoneidx);
+
+
 /******************* HOOK REDEFS HERE *****************************/
 static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
 				struct mem_cgroup *prev,
@@ -138,6 +149,19 @@ static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
 	memcg = pt_mem_cgroup_iter(root, prev, reclaim);
 
 	return memcg;
+}
+
+
+static bool ktmm_zone_watermark_ok_safe(struct zone *z,
+					unsigned int order,
+					unsigned long mark,
+					int highest_zoneidx)
+{
+	bool ret;
+
+	ret = pt_zone_watermark_ok_safe(z, order, mark, highest_zoneidx);
+
+	return ret;
 }
 
 /**
@@ -169,6 +193,7 @@ static int ktmm_balance_pgdat(pg_data_t *pgdat,
 
 	struct scan_control sc = {
 		.nr_to_reclaim = SWAP_CLUSTER_MAX,
+		.gfp_mask = GFP_NOIO,
 		.priority = DEF_PRIORITY,
 		.may_writepage = !laptop_mode, //do not delay writing to disk
 		.may_unmap = 1,
@@ -309,23 +334,32 @@ static void scan_node(pg_data_t *pgdat, int nid)
 	}
 }
 
+
 /**
  * Hook prepare_alloc_pages, and call if zone watermark is lower.
+ *
+ * gfp_t gfp
+ * unsigned int order
+ * int preferred_nid
+ * nodemask_t *nodemask
+ * struct alloc_context *ac
+ * gfp_t alloc_gfp
+ * unsigned int alloc_flags
  *
  * We can get the node id from the zone when either of these are called:
  *
  * zone_watermark_fast
  * zone_watermark_ok
  */
-/*
 void wakeup_tmemd(int nid)
 {
 	//check to make sure tmemd in waiting
+	if (!waitqueue_active(&tmemd_wait[nid]))
+		return;
 	
 	//if it is waiting, wake up
-
+	wake_up_interruptible(&tmemd_wait[nid]);
 }
-*/
 
 
 static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
@@ -404,6 +438,36 @@ static int tmemd(void *p)
 }
 
 
+static int wmark_watchdogd(void *p)
+{
+	struct zone *zone;
+	gfp_t flags = TMEMD_GFP_FLAGS;
+	int nid;
+	int highest_zoneidx;
+	unsigned long watermark;
+	bool ok;
+
+	do {
+		for_each_populated_zone(zone) {
+
+			highest_zoneidx = gfp_zone(flags);
+			watermark = high_wmark_pages(zone);
+			nid = zone_to_nid(zone);
+
+			ok = ktmm_zone_watermark_ok_safe(zone, 0, 
+					watermark, highest_zoneidx);
+
+			if (!ok) wakeup_tmemd(nid);
+		}
+
+		ssleep(1);
+
+	} while(!kthread_should_stop());
+
+	return 0;
+}
+
+
 /*
 int kswapd_convert_available(void)
 {
@@ -456,6 +520,9 @@ int tmemd_start_available(void)
         	tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
 	}
 
+	/* start the watermark watchdog */
+	wd = kthread_run(&wmark_watchdogd, NULL, "wmark_watchdogd");
+
 	return ret;
 }
 
@@ -466,13 +533,16 @@ int tmemd_start_available(void)
  */
 void tmemd_stop_all(void)
 {
-    int nid;
+	int nid;
 
-    for_each_online_node(nid)
-    {
-        kthread_stop(tmemd_list[nid]);
-    }
+	for_each_online_node(nid)
+	{
+		kthread_stop(tmemd_list[nid]);
+	}
 
-    uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
+	/* start the watermark watchdog */
+	kthread_stop(wd);
+
+	uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 }
 
