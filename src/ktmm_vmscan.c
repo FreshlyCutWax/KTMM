@@ -44,6 +44,11 @@ static struct task_struct *wd;
 wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
 
+// zones we care about watermarks & moving pages
+// ZONE_NORMAL, ZONE_HIGHMEM
+const int ktmm_zone_watchlist[] = {2, 3};
+
+
 /**
  * This is a import of the orignal scan_control struct from mm/vmscan.c. We 
  * will remove most of the comments for the original members for conciseness.
@@ -127,16 +132,20 @@ static int (*pt_balance_pgdat)(pg_data_t *pgdat,
 				int order, 
 				int highest_zoneidx);
 
+
 /* FROM: page_alloc.c */
-/*
-void (*pt__fs_reclaim_acquire)(unsigned long ip);
-*/
-
-
 static bool (*pt_zone_watermark_ok_safe)(struct zone *z,
 					unsigned int order,
 					unsigned long mark,
 					int highest_zoneidx);
+
+
+/* FROM: mmzone.c */
+static struct pglist_data *(*pt_first_online_pgdat)(void);
+
+
+/* FROM: mmzone.c */
+static struct zone *(*pt_next_zone)(struct zone *zone);
 
 
 /******************* HOOK REDEFS HERE *****************************/
@@ -164,14 +173,17 @@ static bool ktmm_zone_watermark_ok_safe(struct zone *z,
 	return ret;
 }
 
-/**
- * Acquire the lock to reclaim memory.
- *
-void ktmm__fs_reclaim_acquire(unsigned long ip)
+
+static struct pglist_data *ktmm_first_online_pgdat(void)
 {
-	pt__fs_reclaim_acquire(ip);
+	return pt_first_online_pgdat();
 }
-*/
+
+
+static struct zone *ktmm_next_zone(struct zone *zone)
+{
+	return pt_next_zone(zone);
+}
 
 
 static int ktmm_balance_pgdat(pg_data_t *pgdat,
@@ -214,13 +226,37 @@ static int ktmm_balance_pgdat(pg_data_t *pgdat,
 	return ret;
 }
 
-
 /****************** ADD VMSCAN HOOKS HERE ************************/
 static struct ktmm_hook vmscan_hooks[] = {
 	HOOK("mem_cgroup_iter", ktmm_mem_cgroup_iter, &pt_mem_cgroup_iter),
 	HOOK("balance_pgdat", ktmm_balance_pgdat, &pt_balance_pgdat),
-	//HOOK("__fs_reclaim_acquire", ktmm__fs_reclaim_acquire, pt__fs_reclaim_acquire),
+	HOOK("zone_watermark_ok", ktmm_zone_watermark_ok_safe, &pt_zone_watermark_ok_safe),
+	HOOK("first_online_pgdat", ktmm_first_online_pgdat, &pt_first_online_pgdat),
+	HOOK("next_zone", ktmm_next_zone, &pt_next_zone),
 };
+
+
+/****************** MACROS & STUFF ******************************/
+bool watching_zonetype(struct zone *z)
+{
+	int i;
+	int last = ARRAY_SIZE(ktmm_zone_watchlist);
+	unsigned long zid = zone_idx(z);
+
+	for (i = 0; i < last; i++)
+		if (ktmm_zone_watchlist[i] == zid) return true;
+
+	return false;
+}
+
+
+#define ktmm_for_each_populated_zone(zone) 			\
+	for (zone = (ktmm_first_online_pgdat())->node_zones; 	\
+		zone;						\
+		zone = ktmm_next_zone(zone))			\
+			if(!populated_zone(zone) || !watching_zonetype(zone)); \
+				/* do nothing */		\
+			else
 
 
 /*****************************************************************************
@@ -303,6 +339,8 @@ static void scan_node(pg_data_t *pgdat, int nid)
 	struct mem_cgroup *root;
 	struct lruvec *lruvec;
 
+	pr_info("scanning lists on node %d", nid);
+
 	// get memory cgroup for the node
 	// tmem_cgroup_iter() = mem_cgroup_iter()
 	root = NULL;
@@ -319,37 +357,33 @@ static void scan_node(pg_data_t *pgdat, int nid)
 		struct list_head *list;
 		list = &lruvec->lists[lru];
 		
-		// for debug purposes, change later
-		pr_debug("scanning evictable LRU list on node %d: %d\n", nid, lru);
-		
 		spin_lock_irqsave(&lruvec->lru_lock, flags);
 		
 		// call list_scan function
 		ref_count = scan_lru_list(list);
 		
 		spin_unlock_irqrestore(&lruvec->lru_lock, flags);
-		
-		// for debug purpses, change later
-		pr_debug("list reference count: %d\n", ref_count);
 	}
 }
 
 
+/*****************************************************************************
+ * Daemon Functions & Related
+ *****************************************************************************/
+
 /**
- * Hook prepare_alloc_pages, and call if zone watermark is lower.
+ * wakeup_tmemd - wake up a sleeping tmemd daemon
  *
- * gfp_t gfp
- * unsigned int order
- * int preferred_nid
- * nodemask_t *nodemask
- * struct alloc_context *ac
- * gfp_t alloc_gfp
- * unsigned int alloc_flags
+ * @nid:	node id
  *
- * We can get the node id from the zone when either of these are called:
+ * @returns:	none
  *
- * zone_watermark_fast
- * zone_watermark_ok
+ * Each tmemd is assigned to a node on the system, so passing the node id tells
+ * the function which node to wake up. We also check to make sure that tmemd is
+ * not currently active and out of sleep before trying to wake it up.
+ *
+ * This is mainly used by the watermark watchdog to wake up tmemd if levels have
+ * reach below satisfactory level (below high watermark).
  */
 void wakeup_tmemd(int nid)
 {
@@ -362,6 +396,18 @@ void wakeup_tmemd(int nid)
 }
 
 
+/**
+ * tmemd_try_to_sleep - put tmemd to sleep if not needed
+ *
+ * @pgdat:	pglist_data node structure
+ * @nid:	node id
+ *
+ * @returns:	none
+ *
+ * A helper function for tmemd to check if it can sleep when there is no need
+ * for it to scan pages. We only want to it to try and migrate pages between
+ * nodes only if memory pressure is great enough to do so.
+ */
 static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
 {
 	long remaining = 0;
@@ -371,8 +417,10 @@ static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
 		return;
 	
 	prepare_to_wait(&tmemd_wait[nid], &wait, TASK_INTERRUPTIBLE);
-
 	remaining = schedule_timeout(HZ);
+
+	finish_wait(&tmemd_wait[nid], &wait);
+	prepare_to_wait(&tmemd_wait[nid], &wait, TASK_INTERRUPTIBLE);
 
 	/*
 	 * If tmemd is interrupted, then we need to come out of sleep and go
@@ -438,6 +486,31 @@ static int tmemd(void *p)
 }
 
 
+/**
+ * wmark_watchdogd - watermark watchdog daemon
+ *
+ * @p:		data (null)
+ *
+ * @returns:	0 on successful exit
+ *
+ * The purpose of this is to keep tabs on memory pressure accross all system
+ * zones. This will keep tmemd from constantly having to scan pages when there
+ * is no need to. When memory pressure falls below the HIGH WATERMARK on any
+ * particular zone, then we want to wake up the tmemd on the appropriate node.
+ *
+ * Keeping tabs on the HIGH WATERMARK is to prevent kswapd from pulling out of
+ * sleep to reclaim pages that we may want to move to a lower/higher tier
+ * instead.
+ *
+ * One problem that will need to be addressed later are pages that may do some
+ * "camping" on the lower tier if memory pressure is relieved. If pressure is
+ * relieved on both tiers, then tmemd will not migrate pages until pressure is
+ * high enough again. Some pages on the lower tier may need to be moved if they
+ * are being accessed enough to warrrent moving them back up to the higher tier.
+ * We'll need a way to wake up tmemd in order to move these pages. Preferably,
+ * we may want to try and move as many pages back up to the upper tier as we
+ * can.
+ */
 static int wmark_watchdogd(void *p)
 {
 	struct zone *zone;
@@ -448,16 +521,25 @@ static int wmark_watchdogd(void *p)
 	bool ok;
 
 	do {
-		for_each_populated_zone(zone) {
+		ktmm_for_each_populated_zone(zone) {
 
 			highest_zoneidx = gfp_zone(flags);
 			watermark = high_wmark_pages(zone);
 			nid = zone_to_nid(zone);
 
+			//pr_debug("wmark_watchdogd scanned zone on node: %d", nid);
+			//pr_debug("zone name: %s", zone->name);
+			//pr_debug("zone idx: %lu", zone_idx(zone));
+
 			ok = ktmm_zone_watermark_ok_safe(zone, 0, 
 					watermark, highest_zoneidx);
 
-			if (!ok) wakeup_tmemd(nid);
+			//pr_debug("Is zone ok? : %d", ok);
+
+			if (!ok) {
+				pr_debug("BELOW WMARK: node %d, zone %s (%lu)", nid, zone->name, zone_idx(zone));
+				wakeup_tmemd(nid);
+			}
 		}
 
 		ssleep(1);
@@ -466,24 +548,6 @@ static int wmark_watchdogd(void *p)
 
 	return 0;
 }
-
-
-/*
-int kswapd_convert_available(void)
-{
-	int ret;
-
-	ret = install_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
-
-	return ret;
-}
-
-
-void kswapd_revert_all(void)
-{
-    uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
-}
-*/
 
 
 /**
