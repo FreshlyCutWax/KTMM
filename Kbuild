@@ -1,4 +1,6 @@
-obj-m += tmem_csc450.o
-tmem_csc450-y := src/tmem_main.o
-tmem_csc450-y += src/tmem_vmscan.o
-tmem_csc450-y += src/tmem_syms.o
+EXTRA_CFLAGS += -DDEBUG
+
+obj-m += ktmm.o
+ktmm-y := src/ktmm_main.o
+ktmm-y += src/ktmm_vmscan.o
+ktmm-y += src/ktmm_hook.o
