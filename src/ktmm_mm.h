@@ -17,7 +17,7 @@ struct pglist_data_ext {
 	int pmem_node;
 };
 
-/* which node is has persistent memory */
+/* which node is has persistent memory (GLOBAL) */
 extern int pmem_node_id;
 
 /* holds all the ptrs to ALL instances of pglist_data_ext */
@@ -28,16 +28,21 @@ extern struct pglist_data_ext *node_data_ext[MAX_NUMNODES];
 #define NODE_DATA_EXT(nid)	(node_data_ext[nid])
 
 
+/* get the next page/folio in the list */
+#define lru_to_page_next(head) (list_entry((head)->next, struct page, lru))
+#define lru_to_folio_next(head) (list_entry((head)->next, struct folio, lru))
+
 /* 
  * GFP bitmask for persistent memory
  *
  * This might need changing for later versions of the kernel.
- *
  * This would be bit 29 of a 32-bit unsigned int (unreserved).
  *
  * Combination: GFP_PMEM | GFP_USER
  *
  * GFP_USER = __GFP_HARDWALL | __GFP_FS | __GFP_IO
+ *
+ * Checkout linux/gfp_types.h for more.
  */
 #define GFP_PMEM	0x10000000u
 
