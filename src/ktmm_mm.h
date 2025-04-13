@@ -28,4 +28,18 @@ extern struct pglist_data_ext *node_data_ext[MAX_NUMNODES];
 #define NODE_DATA_EXT(nid)	(node_data_ext[nid])
 
 
+/* 
+ * GFP bitmask for persistent memory
+ *
+ * This might need changing for later versions of the kernel.
+ *
+ * This would be bit 29 of a 32-bit unsigned int (unreserved).
+ *
+ * Combination: GFP_PMEM | GFP_USER
+ *
+ * GFP_USER = __GFP_HARDWALL | __GFP_FS | __GFP_IO
+ */
+#define GFP_PMEM	0x10000000u
+
+
 #endif /* KTMM_MM_HEADER_H */
