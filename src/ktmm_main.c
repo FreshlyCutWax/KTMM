@@ -20,13 +20,6 @@ MODULE_AUTHOR("Jared Draper, Josh Borthick, Grant Wilke, Camilo Palomino");
 MODULE_DESCRIPTION("Tiered Memory Module.");
 
 
-/* which node has persistent memory */
-int pmem_node_id = -1;
-
-/* holds all the ptrs to ALL instances of pglist_data_ext */
-struct pglist_data_ext *node_data_ext[MAX_NUMNODES];
-
-
 /**
  * module init - called on module installation
  */

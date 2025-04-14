@@ -32,6 +32,8 @@
 
 #define TMEMD_GFP_FLAGS GFP_NOIO
 
+static struct pglist_data_ext *node_data_ext[MAX_NUMNODES];
+
 // Temporary list to hold references to tmem daemons.
 // Replace kswapd task_struct in pglist_data?
 static struct task_struct *tmemd_list[MAX_NUMNODES];
@@ -48,6 +50,39 @@ wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 // ZONE_NORMAL, ZONE_HIGHMEM
 const int ktmm_zone_watchlist[] = {2, 3};
 
+
+/* get the next page/folio in the list */
+#define lru_to_page_next(head) (list_entry((head)->next, struct page, lru))
+
+/**
+ * pglist_data_ext - pglist_data extension for ktmm
+ */
+struct pglist_data_ext {
+	struct pglist_data *pgdat;
+	struct lruvec_ext *lruvec_ext;
+
+	wait_queue_head_t tmemd_wait;
+	struct task_struct *tmemd;
+	int pmem_node;
+};
+
+/* returns a pointer, so make sure you use it correctly */
+#define NODE_DATA_EXT(nid)	(node_data_ext[nid])
+
+
+#define LRU_PROMOTE_BASE 0
+
+enum promote_lru_list {
+	LRU_PROMOTE_ANON = LRU_PROMOTE_BASE,
+	LRU_PROMOTE_FILE,
+	NR_PROMOTE_LISTS,
+};
+
+
+struct lruvec_ext {
+	struct lruvec *lruvec;
+	struct list_head *promote_lru[NR_PROMOTE_LISTS];
+};
 
 /**
  * This is a import of the orignal scan_control struct from mm/vmscan.c. We 
@@ -121,8 +156,7 @@ struct scan_control {
 	struct reclaim_state reclaim_state;
 };
 
-
-/************** IMPORTED/HOOKED PROTOTYPES HERE *******************/
+/************** IMPORTED/HOOKED PROTOTYPES HERE *****************************/
 static struct mem_cgroup *(*pt_mem_cgroup_iter)(struct mem_cgroup *root,
 				struct mem_cgroup *prev,
 				struct mem_cgroup_reclaim_cookie *reclaim);
@@ -148,7 +182,19 @@ static struct pglist_data *(*pt_first_online_pgdat)(void);
 static struct zone *(*pt_next_zone)(struct zone *zone);
 
 
-/******************* HOOK REDEFS HERE *****************************/
+/**************** END IMPORTED/HOOKED PROTOTYPES *****************************/
+static int ktmm_balance_pgdat(pg_data_t *pgdat,
+				int order,
+				int highest_zoneidx)
+{
+	int ret;
+	
+	ret = pt_balance_pgdat(pgdat, order, highest_zoneidx);
+
+	return ret;
+}
+
+
 static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
 				struct mem_cgroup *prev,
 				struct mem_cgroup_reclaim_cookie *reclaim)
@@ -186,57 +232,6 @@ static struct zone *ktmm_next_zone(struct zone *zone)
 }
 
 
-static int ktmm_balance_pgdat(pg_data_t *pgdat,
-				int order,
-				int highest_zoneidx)
-{
-	int ret;
-	
-	/*
-	int i;
-	unsigned long nr_soft_reclaimed;
-	unsigned long nr_soft_scanned;
-	unsigned long pflags;
-	unsigned long nr_boost_reclaim;
-	unsigned long zone_boosts[MAX_NR_ZONES] = { 0, };
-	bool boosted;
-	struct task_struct *tsk = current;
-	struct zone *zone;
-
-	struct scan_control sc = {
-		.nr_to_reclaim = SWAP_CLUSTER_MAX,
-		.gfp_mask = GFP_NOIO,
-		.priority = DEF_PRIORITY,
-		.may_writepage = !laptop_mode, //do not delay writing to disk
-		.may_unmap = 1,
-		.may_swap = 1,
-		.reclaim_idx = MAX_NR_ZONES - 1,
-		.reclaim_state = tsk->reclaim_state,
-	};
-
-	ktmm__fs_reclaim_acquire(_THIS_IP_);
-	*/
-	
-
-	/*
-	 * Call the real balance_pgdat().
-	 */
-	ret = pt_balance_pgdat(pgdat, order, highest_zoneidx);
-
-	return ret;
-}
-
-/****************** ADD VMSCAN HOOKS HERE ************************/
-static struct ktmm_hook vmscan_hooks[] = {
-	HOOK("mem_cgroup_iter", ktmm_mem_cgroup_iter, &pt_mem_cgroup_iter),
-	HOOK("balance_pgdat", ktmm_balance_pgdat, &pt_balance_pgdat),
-	HOOK("zone_watermark_ok", ktmm_zone_watermark_ok_safe, &pt_zone_watermark_ok_safe),
-	HOOK("first_online_pgdat", ktmm_first_online_pgdat, &pt_first_online_pgdat),
-	HOOK("next_zone", ktmm_next_zone, &pt_next_zone),
-};
-
-
-/****************** MACROS & STUFF ******************************/
 bool watching_zonetype(struct zone *z)
 {
 	int i;
@@ -260,8 +255,49 @@ bool watching_zonetype(struct zone *z)
 
 
 /*****************************************************************************
- * Node Scanning Functions
+ * Node Scanning, Shrinking, and Promotion
  *****************************************************************************/
+
+/*
+static void shrink_promotion_list(unsigned long nr_to_scan,
+				struct lruvec *lruvec,
+				struct scan_control *sc,
+				enum lru_list lru)
+{
+	// needs implementation
+	return;
+}
+
+
+static void ktmm_shrink_active_list(unsigned long nr_to_scan, 
+				struct lruvec_ext *lruvec_ext,
+				struct scan_control *sc,
+				enum lru_list lru)
+{
+	return;
+}
+
+
+static unsigned long ktmm_shrink_inactive_list(unsigned long nr_to_scan, 
+					struct lruvec_ext *lruvec_ext,
+					struct scan_control *sc,
+					enum lru_list lru)
+{
+	return 0;
+}
+
+
+static unsigned long ktmm_shrink_list(enum lru_list lru, 
+				unsigned long nr_to_scan,
+				struct lruvec_ext *lruvec_ext, 
+				struct scan_control *sc)
+{
+	if (is_active_lru(lru))
+		ktmm_shrink_active_list(nr_to_scan, lruvec_ext, sc, lru);
+
+	return ktmm_shrink_inactive_list(nr_to_scan, lruvec_ext, sc, lru);
+}
+*/
 
 /* need to acquire spinlock before calling this function */
 
@@ -332,23 +368,51 @@ static unsigned int scan_lru_list(struct list_head *list)
  * struct lru_list, struct lruvec [src/include/mmzone.h]
  * struct mem_cgroup, mem_cgroup_iter() [src/include/memcontrol.h]
  */
-static void scan_node(pg_data_t *pgdat, int nid)
+static void scan_node(pg_data_t *pgdat)
 {
 	enum lru_list lru;
 	struct mem_cgroup *memcg;
-	struct mem_cgroup *root;
 	struct lruvec *lruvec;
+	struct lruvec_ext lruvec_ext;
+	int nid = pgdat->node_id;
 
-	pr_info("scanning lists on node %d", nid);
+	//struct reclaim_state reclaim_state = {
+	//	.reclaimed_slab = 0,
+	//};
+
+	struct mem_cgroup_reclaim_cookie reclaim = {
+		.pgdat = pgdat,
+	};
+
+	struct scan_control sc = {
+		.nr_to_reclaim = SWAP_CLUSTER_MAX,
+		.gfp_mask = GFP_NOIO, //possibly change later
+		.priority = DEF_PRIORITY,
+		.may_writepage = !laptop_mode, //do not delay writing to disk
+		.may_unmap = 1,
+		.may_swap = 1,
+		.reclaim_idx = MAX_NR_ZONES - 1,
+		.target_mem_cgroup = NULL,
+	};
+
+	memset(&sc.nr, 0, sizeof(sc.nr));
+
+	// needs exposed to the module
+	//set_task_reclaim_state(current, &reclaim_state);
+	//task->reclaim_state = &reclaim_state;
 
 	// get memory cgroup for the node
 	// tmem_cgroup_iter() = mem_cgroup_iter()
-	root = NULL;
-	memcg = ktmm_mem_cgroup_iter(root, NULL, NULL);
+	memcg = ktmm_mem_cgroup_iter(sc.target_mem_cgroup, NULL, &reclaim);
 	
 	// acquire the lruvec structure
 	lruvec = &memcg->nodeinfo[nid]->lruvec;
+
+	//will eventually replace the statement above
+	lruvec_ext.lruvec = lruvec;
 	
+	pr_info("scanning lists on node %d", nid);
+
 	// scan the LRU lists
 	for_each_evictable_lru(lru) 
 	{
@@ -364,6 +428,8 @@ static void scan_node(pg_data_t *pgdat, int nid)
 		
 		spin_unlock_irqrestore(&lruvec->lru_lock, flags);
 	}
+
+	//scan promote list here
 }
 
 
@@ -446,15 +512,13 @@ static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
 static int tmemd(void *p) 
 {
 	pg_data_t *pgdat = (pg_data_t *)p;
-	int nid = READ_ONCE(pgdat->node_id);
-	struct task_struct *tsk = current;
-	const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
-
-	pr_debug("tmemd started on node %d", nid);
+	int nid = pgdat->node_id;
+	struct task_struct *task = current;
+	const struct cpumask *cpumask = cpumask_of_node(nid);
 
 	// Only allow node's CPUs to run this task
 	if(!cpumask_empty(cpumask))
-		set_cpus_allowed_ptr(tsk, cpumask);
+		set_cpus_allowed_ptr(task, cpumask);
 
 	/*
 	 * Tell MM that we are a memory allocator, and that we are actually
@@ -462,7 +526,10 @@ static int tmemd(void *p)
 	 *
 	 * Flags are located in include/sched.h for more info.
 	 */
-	tsk->flags |= PF_MEMALLOC | PF_KSWAPD;
+	task->flags |= PF_MEMALLOC | PF_KSWAPD;
+
+
+	pr_debug("tmemd started on node %d", nid);
 
 	/*
 	 * Loop every few seconds and scan the node's LRU lists.
@@ -470,7 +537,7 @@ static int tmemd(void *p)
 	 */
 	for ( ; ; )
 	{
-		scan_node(pgdat, nid);
+		scan_node(pgdat);
 
 		if(kthread_should_stop()) break;
 		
@@ -480,7 +547,8 @@ static int tmemd(void *p)
 		
 	}
 
-	tsk->flags &= ~(PF_MEMALLOC | PF_KSWAPD);
+	task->flags &= ~(PF_MEMALLOC | PF_KSWAPD);
+	current->reclaim_state = NULL;
 	
 	return 0;
 }
@@ -550,6 +618,20 @@ static int wmark_watchdogd(void *p)
 }
 
 
+/*****************************************************************************
+ * Start & Stop
+ *****************************************************************************/
+
+/****************** ADD VMSCAN HOOKS HERE ************************/
+static struct ktmm_hook vmscan_hooks[] = {
+	HOOK("mem_cgroup_iter", ktmm_mem_cgroup_iter, &pt_mem_cgroup_iter),
+	HOOK("balance_pgdat", ktmm_balance_pgdat, &pt_balance_pgdat),
+	HOOK("zone_watermark_ok", ktmm_zone_watermark_ok_safe, &pt_zone_watermark_ok_safe),
+	HOOK("first_online_pgdat", ktmm_first_online_pgdat, &pt_first_online_pgdat),
+	HOOK("next_zone", ktmm_next_zone, &pt_next_zone),
+};
+
+
 /**
  * Daemons are only started on online/active nodes. They are
  * currently stored in a local list, but will later need to be
@@ -574,12 +656,20 @@ int tmemd_start_available(void)
 	/* initialize wait queues for sleeping */
 	for (i = 0; i < MAX_NUMNODES; i++)
 		init_waitqueue_head(&tmemd_wait[i]);
-	
+
 	ret = install_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 	
 	for_each_online_node(nid)
 	{
 		pg_data_t *pgdat = NODE_DATA(nid);
+
+		/*
+		struct pglist_data_ext pgdat_ext = {
+			.pgdat = NODE_DATA(nid),
+		};
+
+		NODE_DATA_EXT(nid) = &pgdat_ext;
+		*/
 		
         	tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
 	}
@@ -609,4 +699,5 @@ void tmemd_stop_all(void)
 
 	uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 }
+
 
