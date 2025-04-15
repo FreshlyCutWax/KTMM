@@ -30,9 +30,10 @@
 #include "ktmm_hook.h"
 #include "ktmm_vmscan.h"
 
+// possibly needs to be GFP_USER?
 #define TMEMD_GFP_FLAGS GFP_NOIO
 
-static struct pglist_data_ext *node_data_ext[MAX_NUMNODES];
+//static struct pglist_data_ext *node_data_ext[MAX_NUMNODES];
 
 // Temporary list to hold references to tmem daemons.
 // Replace kswapd task_struct in pglist_data?
@@ -267,6 +268,7 @@ static void shrink_promotion_list(unsigned long nr_to_scan,
 	// needs implementation
 	return;
 }
+*/
 
 
 static void ktmm_shrink_active_list(unsigned long nr_to_scan, 
@@ -287,7 +289,8 @@ static unsigned long ktmm_shrink_inactive_list(unsigned long nr_to_scan,
 }
 
 
-static unsigned long ktmm_shrink_list(enum lru_list lru, 
+/* similar to: shrink_list() */
+static unsigned long scan_lru_list(enum lru_list lru, 
 				unsigned long nr_to_scan,
 				struct lruvec_ext *lruvec_ext, 
 				struct scan_control *sc)
@@ -297,7 +300,25 @@ static unsigned long ktmm_shrink_list(enum lru_list lru,
 
 	return ktmm_shrink_inactive_list(nr_to_scan, lruvec_ext, sc, lru);
 }
-*/
+
+
+/* similar to: shrink_lruvec() 
+ * 
+ * This might later consume scan_lru_list(), as it might be more simple to put
+ * its code here instead.
+ */
+static void scan_lruvec(struct lruvec_ext *lruvec_ext, struct scan_control *sc)
+{
+	enum lru_list lru;
+
+	// we need to determine this number dynamically later
+	unsigned long nr_to_scan = 1024;
+
+	for_each_evictable_lru(lru) {
+		scan_lru_list(lru, nr_to_scan, lruvec_ext, sc);
+	}
+}
+
 
 /* need to acquire spinlock before calling this function */
 
@@ -323,6 +344,7 @@ static unsigned long ktmm_shrink_list(enum lru_list lru,
  * pageflags enum in page-flags.h. Bit related operations
  * are found in bitops.h.
  */
+/*
 static unsigned int scan_lru_list(struct list_head *list)
 {
 	struct page *page, *next;
@@ -338,6 +360,7 @@ static unsigned int scan_lru_list(struct list_head *list)
 
 	return nr_page_refs;
 }
+*/
 
 
 /**
@@ -370,11 +393,13 @@ static unsigned int scan_lru_list(struct list_head *list)
  */
 static void scan_node(pg_data_t *pgdat)
 {
-	enum lru_list lru;
+	//enum lru_list lru;
+	struct zone *zone;
 	struct mem_cgroup *memcg;
 	struct lruvec *lruvec;
 	struct lruvec_ext lruvec_ext;
 	int nid = pgdat->node_id;
+	int z = 0;
 
 	//struct reclaim_state reclaim_state = {
 	//	.reclaimed_slab = 0,
@@ -385,8 +410,9 @@ static void scan_node(pg_data_t *pgdat)
 	};
 
 	struct scan_control sc = {
-		.nr_to_reclaim = SWAP_CLUSTER_MAX,
-		.gfp_mask = GFP_NOIO, //possibly change later
+		//.nr_to_reclaim = SWAP_CLUSTER_MAX,
+		.nr_to_reclaim = 0,
+		.gfp_mask = TMEMD_GFP_FLAGS,
 		.priority = DEF_PRIORITY,
 		.may_writepage = !laptop_mode, //do not delay writing to disk
 		.may_unmap = 1,
@@ -396,6 +422,15 @@ static void scan_node(pg_data_t *pgdat)
 	};
 
 	memset(&sc.nr, 0, sizeof(sc.nr));
+
+	/* move number of pages proportional to number of zones */
+	for (z = 0; z <= sc.reclaim_idx; z++) {
+		zone = pgdat->node_zones + z;
+		if (!managed_zone(zone))
+			continue;
+
+		sc.nr_to_reclaim += max(high_wmark_pages(zone), SWAP_CLUSTER_MAX);
+	}
 
 	// needs exposed to the module
 	//set_task_reclaim_state(current, &reclaim_state);
@@ -413,7 +448,12 @@ static void scan_node(pg_data_t *pgdat)
 	
 	pr_info("scanning lists on node %d", nid);
 
+
+	//NEEDED: code to determine if we can claim pages
+	//shrink_lruvec_memcg()
+
 	// scan the LRU lists
+	/*
 	for_each_evictable_lru(lru) 
 	{
 		unsigned int ref_count;
@@ -428,6 +468,9 @@ static void scan_node(pg_data_t *pgdat)
 		
 		spin_unlock_irqrestore(&lruvec->lru_lock, flags);
 	}
+	*/
+
+	scan_lruvec(&lruvec_ext, &sc);
 
 	//scan promote list here
 }
