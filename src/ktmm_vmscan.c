@@ -23,9 +23,11 @@
 #include <linux/page-flags.h>
 #include <linux/page_ref.h>
 #include <linux/printk.h>
+#include <linux/signal.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/swap.h>
+#include <linux/vmstat.h>
 #include <linux/wait.h>
 
 #include "ktmm_hook.h"
@@ -70,8 +72,11 @@ struct pglist_data_ext {
 
 /* returns a pointer, so make sure you use it correctly */
 #define NODE_DATA_EXT(nid)	(node_data_ext[nid])
+
+// these will not work correctly because we cannot modify GFP flags
 #define ___GFP_PMEM 		0x1000000u
 #define __GFP_PMEM ((__force gfp_t)___GFP_PMEM)
+
 #define LRU_PROMOTE_BASE 0
 
 enum promote_lru_list {
@@ -295,16 +300,137 @@ static void shrink_promotion_list(unsigned long nr_to_scan,
 */
 
 
-static void ktmm_shrink_active_list(unsigned long nr_to_scan, 
+/* SIMILAR TO: shrink_active_list */
+static void scan_active_list(unsigned long nr_to_scan, 
 				struct lruvec_ext *lruvec_ext,
 				struct scan_control *sc,
 				enum lru_list lru)
 {
+	unsigned long nr_taken;
+	unsigned long nr_scanned;
+	unsigned long vm_flags;
+	unsigned long lock_flags;
+	LIST_HEAD(l_hold);	/* The folios which were snipped off */
+	LIST_HEAD(l_active);
+	LIST_HEAD(l_inactive);
+
+	// multi-clock
+	unsigned long nr_promote;
+	unsigned long pmem_page_sal = 0;
+	unsigned long active_to_promote = 0;
+	LIST_HEAD(l_promote);
+	// end multi-clock
+
+	unsigned nr_deactivate, nr_activate;
+	unsigned nr_rotated = 0;
+	int file = is_file_lru(lru);
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+
+	/* make sure pages in per-cpu lru list are added */
+	lru_add_drain();
+
+	spin_lock_irqsave(&lruvec->lru_lock, flags);
+
+	nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
+				     &nr_scanned, sc, lru);
+
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+
+	if (!cgroup_reclaim(sc))
+		__count_vm_events(PGREFILL, nr_scanned);
+	__count_memcg_events(lruvec_memcg(lruvec), PGREFILL, nr_scanned);
+
+	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
+
+	while (!list_empty(&l_hold)) {
+		struct folio *folio;
+
+		cond_resched();
+		folio = lru_to_folio(&l_hold);
+		list_del(&folio->lru);
+
+		if (unlikely(!folio_evictable(folio))) {
+			folio_putback_lru(folio);
+			continue;
+		}
+
+		if (unlikely(buffer_heads_over_limit)) {
+			if (folio_needs_release(folio) &&
+			    folio_trylock(folio)) {
+				filemap_release_folio(folio, 0);
+				folio_unlock(folio);
+			}
+		}
+
+		// MULTI-CLOCK
+		if (pgdat_ext->pm_node != 0) {
+			pmem_page_sal++;
+			if (page_referenced(page, 0, sc->target_mem_cgroup, & vm_flags)) {
+				//SetPagePromote(page); NEEDS TO BE MODULE TRACKED
+				list_add(&page->lru, &l_promote);
+				active_to_promote++;
+				continue;
+			}
+		}
+
+		// might not need, we only care about promoting here in the
+		// module
+		if (sc->only_promote) {
+			list_add(&page->lru, &l_active);
+		}
+		// END MULTI-CLOCK
+
+		/* Referenced or rmap lock contention: rotate */
+		if (folio_referenced(folio, 0, sc->target_mem_cgroup,
+				     &vm_flags) != 0) {
+			/*
+			 * Identify referenced, file-backed active folios and
+			 * give them one more trip around the active list. So
+			 * that executable code get better chances to stay in
+			 * memory under moderate memory pressure.  Anon folios
+			 * are not likely to be evicted by use-once streaming
+			 * IO, plus JVM can create lots of anon VM_EXEC folios,
+			 * so we ignore them here.
+			 */
+			if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio)) {
+				nr_rotated += folio_nr_pages(folio);
+				list_add(&folio->lru, &l_active);
+				continue;
+			}
+		}
+
+		folio_clear_active(folio);	/* we are de-activating */
+		folio_set_workingset(folio);
+		list_add(&folio->lru, &l_inactive);
+	}
+
+	/*
+	 * Move folios back to the lru list.
+	 */
+	spin_lock_irqsave(&lruvec->lru_lock, flags);
+
+	nr_activate = move_folios_to_lru(lruvec, &l_active);
+	nr_deactivate = move_folios_to_lru(lruvec, &l_inactive);
+	/* Keep all free folios in l_active list */
+	list_splice(&l_inactive, &l_active);
+
+	__count_vm_events(PGDEACTIVATE, nr_deactivate);
+	__count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_deactivate);
+
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+
+	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
+
+	mem_cgroup_uncharge_list(&l_active);
+	free_unref_page_list(&l_active);
+	trace_mm_vmscan_lru_shrink_active(pgdat->node_id, nr_taken, nr_activate,
+			nr_deactivate, nr_rotated, sc->priority, file);
 	return;
 }
 
 
-static unsigned long ktmm_shrink_inactive_list(unsigned long nr_to_scan, 
+/* SIMILAR TO: shrink_inactive_list() */
+static unsigned long scan_inactive_list(unsigned long nr_to_scan, 
 					struct lruvec_ext *lruvec_ext,
 					struct scan_control *sc,
 					enum lru_list lru)
@@ -313,6 +439,7 @@ static unsigned long ktmm_shrink_inactive_list(unsigned long nr_to_scan,
 	unsigned long nr_scanned;
 	unsigned int nr_reclaimed = 0;
 	unsigned long nr_taken;
+	int nr_migrated;
 	struct reclaim_stat stat;
 	bool file = is_file_lru(lru);
 	enum vm_event_item item;
@@ -320,6 +447,15 @@ static unsigned long ktmm_shrink_inactive_list(unsigned long nr_to_scan,
 	struct pglist_data_ext *pgext = pglist_data_ext(lruvec_ext->lruvec);
 	bool stalled = false;
 
+	/*
+	 * unlikely() checks if the branch is unlikely to be executed (branch
+	 * prediction).
+	 *
+	 * functions that need to be exposed or rewritten here:
+	 * 	too_many_isolated (rewrite, needs sc)
+	 * 	reclaim_throttle (expose using hook)
+	 * 	fatal_signal_pending (expose? from signal.h)
+	 */
 	while (unlikely(too_many_isolated(pgdat, file, sc))) {
 		if (stalled)
 			return 0;
@@ -333,8 +469,16 @@ static unsigned long ktmm_shrink_inactive_list(unsigned long nr_to_scan,
 			return SWAP_CLUSTER_MAX;
 	}
 
+	/* make sure pages in per-cpu lru list are added */
 	lru_add_drain();
 
+	/*
+	 * We want to isolate the pages we are going to scan.
+	 *
+	 * functions that need to be exposed or rewritten here:
+	 * 	isolate_lru_folio / or pages? (rewrite)
+	 * 	
+	 */
 	spin_lock_irq(&lruvec_ext->lruvec->lru_lock);
 
 	nr_taken = isolate_lru_folios(nr_to_scan, lruvec_ext->lruvec, &folio_list,
@@ -352,12 +496,14 @@ static unsigned long ktmm_shrink_inactive_list(unsigned long nr_to_scan,
 	if (nr_taken == 0)
 		return 0;
 
+	// MULTI-CLOCK
 	if (pgext->pmem_node == 0) {
 		int ret = migrate_pages(&folio_list, vmscan_alloc_pmem_page, NULL, 
 								0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG);
 		nr_reclaimed = (ret >= 0 ? nr_taken - ret : 0);
 		__mod_node_page_state(pgdat, NR_DEMOTED, nr_reclaimed);
 	}
+	// END MULTI-CLOCK
 
 	nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, false);
 
@@ -377,12 +523,12 @@ static unsigned long ktmm_shrink_inactive_list(unsigned long nr_to_scan,
 	free_unref_page_list(&folio_list);
 
 	/*
-	 * If dirty folios are scanned that are not queued for IO, it
+	 * If dirty pages are scanned that are not queued for IO, it
 	 * implies that flushers are not doing their job. This can
-	 * happen when memory pressure pushes dirty folios to the end of
+	 * happen when memory pressure pushes dirty pages to the end of
 	 * the LRU before the dirty limits are breached and the dirty
 	 * data has expired. It can also happen when the proportion of
-	 * dirty folios grows not through writes but through memory
+	 * dirty pages grows not through writes but through memory
 	 * pressure reclaiming all the clean cache. And in some cases,
 	 * the flushers simply cannot keep up with the allocation
 	 * rate. Nudge the flusher threads in case they are asleep.
@@ -392,16 +538,22 @@ static unsigned long ktmm_shrink_inactive_list(unsigned long nr_to_scan,
 		/*
 		 * For cgroupv1 dirty throttling is achieved by waking up
 		 * the kernel flusher here and later waiting on folios
+		 * the kernel flusher here and later waiting on pages
 		 * which are in writeback to finish (see shrink_folio_list()).
 		 *
 		 * Flusher may not be able to issue writeback quickly
 		 * enough for cgroupv1 writeback throttling to work
 		 * on a large system.
+		 *
+		 * NEED TO REWRITE: writeback_throttling_sane()
+		 * EXPOSE USING HOOKS: reclaim_throttle()
 		 */
 		if (!writeback_throttling_sane(sc))
 			reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
 	}
 
+	// possibly remove or rewrite this portion
+	// if we dont reclaim, then we don't have these
 	sc->nr.dirty += stat.nr_dirty;
 	sc->nr.congested += stat.nr_congested;
 	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
@@ -411,13 +563,15 @@ static unsigned long ktmm_shrink_inactive_list(unsigned long nr_to_scan,
 	if (file)
 		sc->nr.file_taken += nr_taken;
 
+	// same here, if we didn't reclaim anything, then why?
 	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
 			nr_scanned, nr_reclaimed, &stat, sc->priority, file);
-	return nr_reclaimed;
+
+	return nr_migrated;
 }
 
 
-/* similar to: shrink_list() */
+/* SIMILAR TO: shrink_list() */
 static unsigned long scan_lru_list(enum lru_list lru, 
 				unsigned long nr_to_scan,
 				struct lruvec_ext *lruvec_ext, 
