@@ -9,6 +9,7 @@
 #include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
+#include <linux/gfp.h>
 #include <linux/freezer.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
@@ -69,8 +70,8 @@ struct pglist_data_ext {
 
 /* returns a pointer, so make sure you use it correctly */
 #define NODE_DATA_EXT(nid)	(node_data_ext[nid])
-
-
+#define ___GFP_PMEM 		0x1000000u
+#define __GFP_PMEM ((__force gfp_t)___GFP_PMEM)
 #define LRU_PROMOTE_BASE 0
 
 enum promote_lru_list {
@@ -84,6 +85,19 @@ struct lruvec_ext {
 	struct lruvec *lruvec;
 	struct list_head *promote_lru[NR_PROMOTE_LISTS];
 };
+
+struct page* vmscan_alloc_pmem_page(struct  page *page, unsigned long data)
+{
+		gfp_t gfp_mask = GFP_USER | __GFP_PMEM;
+		//return alloc_pages_node(pmem_node_id, gfp_mask, 0);
+		return alloc_page(gfp_mask);
+}
+
+struct page* vmscan_alloc_normal_page(struct page *page, unsigned long data)
+{
+        gfp_t gfp_mask = GFP_USER;
+        return alloc_page(gfp_mask);
+}
 
 /**
  * This is a import of the orignal scan_control struct from mm/vmscan.c. We 
@@ -118,6 +132,10 @@ struct scan_control {
 	unsigned int memcg_low_skipped:1;
 	unsigned int hibernation_mode:1;
 	unsigned int compaction_ready:1;
+
+	/* Searching for pages to promote */
+	unsigned int only_promote:1;
+
 	unsigned int cache_trim_mode:1;
 	unsigned int file_is_tiny:1;
 	unsigned int no_demotion:1;
@@ -166,6 +184,12 @@ static struct mem_cgroup *(*pt_mem_cgroup_iter)(struct mem_cgroup *root,
 static int (*pt_balance_pgdat)(pg_data_t *pgdat, 
 				int order, 
 				int highest_zoneidx);
+
+/* FROM: vmscan.c */
+static unsigned long (*pt_shrink_inactive_list)(unsigned long nr_to_scan, 
+				struct lruvec_ext *lruvec_ext,
+				struct scan_control *sc,
+				enum lru_list lru);
 
 
 /* FROM: page_alloc.c */
@@ -285,7 +309,111 @@ static unsigned long ktmm_shrink_inactive_list(unsigned long nr_to_scan,
 					struct scan_control *sc,
 					enum lru_list lru)
 {
-	return 0;
+	LIST_HEAD(folio_list);
+	unsigned long nr_scanned;
+	unsigned int nr_reclaimed = 0;
+	unsigned long nr_taken;
+	struct reclaim_stat stat;
+	bool file = is_file_lru(lru);
+	enum vm_event_item item;
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec_ext->lruvec);
+	struct pglist_data_ext *pgext = pglist_data_ext(lruvec_ext->lruvec);
+	bool stalled = false;
+
+	while (unlikely(too_many_isolated(pgdat, file, sc))) {
+		if (stalled)
+			return 0;
+
+		/* wait a bit for the reclaimer. */
+		stalled = true;
+		reclaim_throttle(pgdat, VMSCAN_THROTTLE_ISOLATED);
+
+		/* We are about to die and free our memory. Return now. */
+		if (fatal_signal_pending(current))
+			return SWAP_CLUSTER_MAX;
+	}
+
+	lru_add_drain();
+
+	spin_lock_irq(&lruvec_ext->lruvec->lru_lock);
+
+	nr_taken = isolate_lru_folios(nr_to_scan, lruvec_ext->lruvec, &folio_list,
+				     &nr_scanned, sc, lru);
+
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+	item = current_is_kswapd() ? PGSCAN_KSWAPD : PGSCAN_DIRECT;
+	if (!cgroup_reclaim(sc))
+		__count_vm_events(item, nr_scanned);
+	__count_memcg_events(lruvec_memcg(lruvec_ext->lruvec), item, nr_scanned);
+	__count_vm_events(PGSCAN_ANON + file, nr_scanned);
+
+	spin_unlock_irq(&lruvec_ext->lruvec->lru_lock);
+
+	if (nr_taken == 0)
+		return 0;
+
+	if (pgext->pmem_node == 0) {
+		int ret = migrate_pages(&folio_list, vmscan_alloc_pmem_page, NULL, 
+								0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG);
+		nr_reclaimed = (ret >= 0 ? nr_taken - ret : 0);
+		__mod_node_page_state(pgdat, NR_DEMOTED, nr_reclaimed);
+	}
+
+	nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, false);
+
+	spin_lock_irq(&lruvec_ext->lruvec->lru_lock);
+	move_folios_to_lru(lruvec_ext->lruvec, &folio_list);
+
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+	item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
+	if (!cgroup_reclaim(sc))
+		__count_vm_events(item, nr_reclaimed);
+	__count_memcg_events(lruvec_memcg(lruvec_ext->lruvec), item, nr_reclaimed);
+	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
+	spin_unlock_irq(&lruvec_ext->lruvec->lru_lock);
+
+	lru_note_cost(lruvec_ext->lruvec, file, stat.nr_pageout);
+	mem_cgroup_uncharge_list(&folio_list);
+	free_unref_page_list(&folio_list);
+
+	/*
+	 * If dirty folios are scanned that are not queued for IO, it
+	 * implies that flushers are not doing their job. This can
+	 * happen when memory pressure pushes dirty folios to the end of
+	 * the LRU before the dirty limits are breached and the dirty
+	 * data has expired. It can also happen when the proportion of
+	 * dirty folios grows not through writes but through memory
+	 * pressure reclaiming all the clean cache. And in some cases,
+	 * the flushers simply cannot keep up with the allocation
+	 * rate. Nudge the flusher threads in case they are asleep.
+	 */
+	if (stat.nr_unqueued_dirty == nr_taken) {
+		wakeup_flusher_threads(WB_REASON_VMSCAN);
+		/*
+		 * For cgroupv1 dirty throttling is achieved by waking up
+		 * the kernel flusher here and later waiting on folios
+		 * which are in writeback to finish (see shrink_folio_list()).
+		 *
+		 * Flusher may not be able to issue writeback quickly
+		 * enough for cgroupv1 writeback throttling to work
+		 * on a large system.
+		 */
+		if (!writeback_throttling_sane(sc))
+			reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
+	}
+
+	sc->nr.dirty += stat.nr_dirty;
+	sc->nr.congested += stat.nr_congested;
+	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
+	sc->nr.writeback += stat.nr_writeback;
+	sc->nr.immediate += stat.nr_immediate;
+	sc->nr.taken += nr_taken;
+	if (file)
+		sc->nr.file_taken += nr_taken;
+
+	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
+			nr_scanned, nr_reclaimed, &stat, sc->priority, file);
+	return nr_reclaimed;
 }
 
 
@@ -672,6 +800,7 @@ static struct ktmm_hook vmscan_hooks[] = {
 	HOOK("zone_watermark_ok", ktmm_zone_watermark_ok_safe, &pt_zone_watermark_ok_safe),
 	HOOK("first_online_pgdat", ktmm_first_online_pgdat, &pt_first_online_pgdat),
 	HOOK("next_zone", ktmm_next_zone, &pt_next_zone),
+	HOOK("shrink_inactive_list", ktmm_shrink_inactive_list, &pt_shrink_inactive_list),
 };
 
 
