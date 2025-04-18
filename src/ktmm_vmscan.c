@@ -32,9 +32,14 @@
 
 #include "ktmm_hook.h"
 #include "ktmm_vmscan.h"
+#include "ktmm_mm.h"
+#include "ktmm_vmhooks.h"
 
 // possibly needs to be GFP_USER?
 #define TMEMD_GFP_FLAGS GFP_NOIO
+
+struct pglist_data_ext node_data_ext[MAX_NUMNODES];
+
 
 // Temporary list to hold references to tmem daemons.
 // Replace kswapd task_struct in pglist_data?
@@ -51,171 +56,6 @@ wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 // zones we care about watermarks & moving pages
 // ZONE_NORMAL, ZONE_HIGHMEM
 const int ktmm_zone_watchlist[] = {2, 3};
-
-
-// these will not work correctly because we cannot modify GFP flags
-#define ___GFP_PMEM 		0x1000000u
-#define __GFP_PMEM ((__force gfp_t)___GFP_PMEM)
-
-
-struct page* vmscan_alloc_pmem_page(struct  page *page, unsigned long data)
-{
-		gfp_t gfp_mask = GFP_USER | __GFP_PMEM;
-		//return alloc_pages_node(pmem_node_id, gfp_mask, 0);
-		return alloc_page(gfp_mask);
-}
-
-struct page* vmscan_alloc_normal_page(struct page *page, unsigned long data)
-{
-        gfp_t gfp_mask = GFP_USER;
-        return alloc_page(gfp_mask);
-}
-
-/************** IMPORTED/HOOKED PROTOTYPES HERE *****************************/
-static struct mem_cgroup *(*pt_mem_cgroup_iter)(struct mem_cgroup *root,
-				struct mem_cgroup *prev,
-				struct mem_cgroup_reclaim_cookie *reclaim);
-
-
-/* FROM: page_alloc.c */
-static bool (*pt_zone_watermark_ok_safe)(struct zone *z,
-					unsigned int order,
-					unsigned long mark,
-					int highest_zoneidx);
-
-
-/* FROM: mmzone.c */
-static struct pglist_data *(*pt_first_online_pgdat)(void);
-
-
-/* FROM: mmzone.c */
-static struct zone *(*pt_next_zone)(struct zone *zone);
-
-
-/**************** END IMPORTED/HOOKED PROTOTYPES *****************************/
-static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
-				struct mem_cgroup *prev,
-				struct mem_cgroup_reclaim_cookie *reclaim)
-{
-	return pt_mem_cgroup_iter(root, prev, reclaim);
-}
-
-
-static bool ktmm_zone_watermark_ok_safe(struct zone *z,
-					unsigned int order,
-					unsigned long mark,
-					int highest_zoneidx)
-{
-	return pt_zone_watermark_ok_safe(z, order, mark, highest_zoneidx);
-}
-
-
-static struct pglist_data *ktmm_first_online_pgdat(void)
-{
-	return pt_first_online_pgdat();
-}
-
-
-static struct zone *ktmm_next_zone(struct zone *zone)
-{
-	return pt_next_zone(zone);
-}
-
-
-/*****************************************************************************
- * NODE & LRUVEC
- *****************************************************************************/
-
-#define LRU_PROMOTE 2
-#define KTMM_LRU_FILE 3
-
-enum ktmm_lru_list {
-	INACTIVE_ANON_LIST = LRU_BASE,
-	ACTIVE_ANON_LIST = LRU_BASE + LRU_ACTIVE,
-	PROMOTE_ANON_LIST = LRU_BASE + LRU_PROMOTE,
-	INACTIVE_FILE_LIST = LRU_BASE + KTMM_LRU_FILE,
-	ACTIVE_FILE_LIST = LRU_BASE + KTMM_LRU_FILE + LRU_ACTIVE,
-	PROMOTE_FILE_LIST = LRU_BASE + KTMM_LRU_FILE + LRU_PROMOTE,
-	UNEVICTABLE_LIST,
-	NR_LISTS_LRU,
-};
-
-
-struct lruvec_ext {
-	struct lruvec *lruvec;
-	struct list_head promote_anon_list;
-	struct list_head promote_file_list;
-	struct list_head *lists[NR_LISTS_LRU];
-};
-
-
-/**
- * pglist_data_ext - pglist_data extension for ktmm
- */
-struct pglist_data_ext {
-	struct pglist_data *pgdat;
-	struct lruvec_ext lruvec_ext;
-
-	wait_queue_head_t tmemd_wait;
-	struct task_struct *tmemd;
-
-	int pmem_node;
-};
-
-/* global list of extension data for nodes */
-static struct pglist_data_ext node_data_ext[MAX_NUMNODES];
-
-
-/* returns a pointer, so make sure you use it correctly */
-#define NODE_DATA_EXT(nid)	(&node_data_ext[nid])
-
-
-static void init_node_lruvec_ext(struct pglist_data_ext *pgdat_ext)
-{
-	struct mem_cgroup *memcg; 
-	struct lruvec *lruvec;
-	struct lruvec_ext *lruvec_ext = &pgdat_ext->lruvec_ext;
-	int nid = pgdat_ext->pgdat->node_id;
-
-	/* get node lruvec */
-	memcg = ktmm_mem_cgroup_iter(NULL, NULL, NULL);
-	//lruvec = mem_cgroup_lruvec(memcg, pgdat_ext->pgdat);
-	lruvec = &memcg->nodeinfo[nid]->lruvec;
-	lruvec_ext->lruvec = lruvec;
-
-	 /* init promote lists */
-	INIT_LIST_HEAD(&lruvec_ext->promote_anon_list);
-	INIT_LIST_HEAD(&lruvec_ext->promote_file_list);
-
-	/* set pointer list to all lru lists (including promote) */
-	lruvec_ext->lists[INACTIVE_ANON_LIST] = &lruvec->lists[LRU_INACTIVE_ANON];
-	lruvec_ext->lists[ACTIVE_ANON_LIST] = &lruvec->lists[LRU_ACTIVE_ANON];
-	lruvec_ext->lists[PROMOTE_ANON_LIST] = &lruvec_ext->promote_anon_list;
-	lruvec_ext->lists[INACTIVE_FILE_LIST] = &lruvec->lists[LRU_INACTIVE_FILE];
-	lruvec_ext->lists[ACTIVE_FILE_LIST] = &lruvec->lists[LRU_ACTIVE_FILE];
-	lruvec_ext->lists[PROMOTE_FILE_LIST] = &lruvec_ext->promote_file_list;
-	lruvec_ext->lists[UNEVICTABLE_LIST] = &lruvec->lists[LRU_UNEVICTABLE];
-}
-
-
-static void init_node_data_ext(int nid)
-{
-	struct pglist_data_ext *pgdat_ext = NODE_DATA_EXT(nid);
-
-	pgdat_ext->pgdat = NODE_DATA(nid);
-	pgdat_ext->pmem_node = -1;
-
-	pr_debug("init node data");
-
-	init_waitqueue_head(&pgdat_ext->tmemd_wait);
-	pr_debug("init node tmemd wait");
-
-	init_node_lruvec_ext(pgdat_ext);
-	pr_debug("init node lruvec_ext");
-}
-
-/* get the next page/folio in the list */
-#define lru_to_page_next(head) (list_entry((head)->next, struct page, lru))
 
 
 /*****************************************************************************
@@ -983,15 +823,6 @@ static int wmark_watchdogd(void *p)
  * Start & Stop
  *****************************************************************************/
 
-/****************** ADD VMSCAN HOOKS HERE ************************/
-static struct ktmm_hook vmscan_hooks[] = {
-	HOOK("mem_cgroup_iter", ktmm_mem_cgroup_iter, &pt_mem_cgroup_iter),
-	HOOK("zone_watermark_ok", ktmm_zone_watermark_ok_safe, &pt_zone_watermark_ok_safe),
-	HOOK("first_online_pgdat", ktmm_first_online_pgdat, &pt_first_online_pgdat),
-	HOOK("next_zone", ktmm_next_zone, &pt_next_zone),
-};
-
-
 /**
  * Daemons are only started on online/active nodes. They are
  * currently stored in a local list, but will later need to be
@@ -1009,7 +840,7 @@ int tmemd_start_available(void)
 {
 	int i;
 	int nid;
-	int ret;
+	//int ret;
 
 	pr_debug("starting tmemd on available nodes");
 	
@@ -1017,7 +848,7 @@ int tmemd_start_available(void)
 	for (i = 0; i < MAX_NUMNODES; i++)
 		init_waitqueue_head(&tmemd_wait[i]);
 
-	ret = install_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
+	//ret = install_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 	
 	for_each_online_node(nid)
 	{
@@ -1030,7 +861,7 @@ int tmemd_start_available(void)
 	/* start the watermark watchdog */
 	wd = kthread_run(&wmark_watchdogd, NULL, "wmark_watchdogd");
 
-	return ret;
+	return 0;
 }
 
 
@@ -1050,7 +881,7 @@ void tmemd_stop_all(void)
 	/* start the watermark watchdog */
 	kthread_stop(wd);
 
-	uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
+	//uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 }
 
 
