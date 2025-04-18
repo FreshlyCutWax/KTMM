@@ -9,6 +9,7 @@
 #include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
+#include <linux/gfp.h>
 #include <linux/freezer.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
@@ -22,15 +23,23 @@
 #include <linux/page-flags.h>
 #include <linux/page_ref.h>
 #include <linux/printk.h>
+#include <linux/signal.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/swap.h>
+#include <linux/vmstat.h>
 #include <linux/wait.h>
 
 #include "ktmm_hook.h"
 #include "ktmm_vmscan.h"
+#include "ktmm_mm.h"
+#include "ktmm_vmhooks.h"
 
+// possibly needs to be GFP_USER?
 #define TMEMD_GFP_FLAGS GFP_NOIO
+
+struct pglist_data_ext node_data_ext[MAX_NUMNODES];
+
 
 // Temporary list to hold references to tmem daemons.
 // Replace kswapd task_struct in pglist_data?
@@ -48,6 +57,10 @@ wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 // ZONE_NORMAL, ZONE_HIGHMEM
 const int ktmm_zone_watchlist[] = {2, 3};
 
+
+/*****************************************************************************
+ * Node Scanning, Shrinking, and Promotion
+ *****************************************************************************/
 
 /**
  * This is a import of the orignal scan_control struct from mm/vmscan.c. We 
@@ -82,6 +95,10 @@ struct scan_control {
 	unsigned int memcg_low_skipped:1;
 	unsigned int hibernation_mode:1;
 	unsigned int compaction_ready:1;
+
+	/* Searching for pages to promote */
+	unsigned int only_promote:1;
+
 	unsigned int cache_trim_mode:1;
 	unsigned int file_is_tiny:1;
 	unsigned int no_demotion:1;
@@ -122,121 +139,6 @@ struct scan_control {
 };
 
 
-/************** IMPORTED/HOOKED PROTOTYPES HERE *******************/
-static struct mem_cgroup *(*pt_mem_cgroup_iter)(struct mem_cgroup *root,
-				struct mem_cgroup *prev,
-				struct mem_cgroup_reclaim_cookie *reclaim);
-
-/* FROM: vmscan.c */
-static int (*pt_balance_pgdat)(pg_data_t *pgdat, 
-				int order, 
-				int highest_zoneidx);
-
-
-/* FROM: page_alloc.c */
-static bool (*pt_zone_watermark_ok_safe)(struct zone *z,
-					unsigned int order,
-					unsigned long mark,
-					int highest_zoneidx);
-
-
-/* FROM: mmzone.c */
-static struct pglist_data *(*pt_first_online_pgdat)(void);
-
-
-/* FROM: mmzone.c */
-static struct zone *(*pt_next_zone)(struct zone *zone);
-
-
-/******************* HOOK REDEFS HERE *****************************/
-static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
-				struct mem_cgroup *prev,
-				struct mem_cgroup_reclaim_cookie *reclaim)
-{
-	struct mem_cgroup *memcg;
-
-	memcg = pt_mem_cgroup_iter(root, prev, reclaim);
-
-	return memcg;
-}
-
-
-static bool ktmm_zone_watermark_ok_safe(struct zone *z,
-					unsigned int order,
-					unsigned long mark,
-					int highest_zoneidx)
-{
-	bool ret;
-
-	ret = pt_zone_watermark_ok_safe(z, order, mark, highest_zoneidx);
-
-	return ret;
-}
-
-
-static struct pglist_data *ktmm_first_online_pgdat(void)
-{
-	return pt_first_online_pgdat();
-}
-
-
-static struct zone *ktmm_next_zone(struct zone *zone)
-{
-	return pt_next_zone(zone);
-}
-
-
-static int ktmm_balance_pgdat(pg_data_t *pgdat,
-				int order,
-				int highest_zoneidx)
-{
-	int ret;
-	
-	/*
-	int i;
-	unsigned long nr_soft_reclaimed;
-	unsigned long nr_soft_scanned;
-	unsigned long pflags;
-	unsigned long nr_boost_reclaim;
-	unsigned long zone_boosts[MAX_NR_ZONES] = { 0, };
-	bool boosted;
-	struct task_struct *tsk = current;
-	struct zone *zone;
-
-	struct scan_control sc = {
-		.nr_to_reclaim = SWAP_CLUSTER_MAX,
-		.gfp_mask = GFP_NOIO,
-		.priority = DEF_PRIORITY,
-		.may_writepage = !laptop_mode, //do not delay writing to disk
-		.may_unmap = 1,
-		.may_swap = 1,
-		.reclaim_idx = MAX_NR_ZONES - 1,
-		.reclaim_state = tsk->reclaim_state,
-	};
-
-	ktmm__fs_reclaim_acquire(_THIS_IP_);
-	*/
-	
-
-	/*
-	 * Call the real balance_pgdat().
-	 */
-	ret = pt_balance_pgdat(pgdat, order, highest_zoneidx);
-
-	return ret;
-}
-
-/****************** ADD VMSCAN HOOKS HERE ************************/
-static struct ktmm_hook vmscan_hooks[] = {
-	HOOK("mem_cgroup_iter", ktmm_mem_cgroup_iter, &pt_mem_cgroup_iter),
-	HOOK("balance_pgdat", ktmm_balance_pgdat, &pt_balance_pgdat),
-	HOOK("zone_watermark_ok", ktmm_zone_watermark_ok_safe, &pt_zone_watermark_ok_safe),
-	HOOK("first_online_pgdat", ktmm_first_online_pgdat, &pt_first_online_pgdat),
-	HOOK("next_zone", ktmm_next_zone, &pt_next_zone),
-};
-
-
-/****************** MACROS & STUFF ******************************/
 bool watching_zonetype(struct zone *z)
 {
 	int i;
@@ -250,7 +152,7 @@ bool watching_zonetype(struct zone *z)
 }
 
 
-#define ktmm_for_each_populated_zone(zone) 			\
+#define for_each_observed_zone(zone) 				\
 	for (zone = (ktmm_first_online_pgdat())->node_zones; 	\
 		zone;						\
 		zone = ktmm_next_zone(zone))			\
@@ -259,9 +161,322 @@ bool watching_zonetype(struct zone *z)
 			else
 
 
-/*****************************************************************************
- * Node Scanning Functions
- *****************************************************************************/
+/*
+static void shrink_promotion_list(unsigned long nr_to_scan,
+				struct lruvec *lruvec,
+				struct scan_control *sc,
+				enum lru_list lru)
+{
+	// needs implementation
+	return;
+}
+*/
+
+
+/* SIMILAR TO: shrink_active_list */
+static void scan_active_list(unsigned long nr_to_scan, 
+				struct lruvec_ext *lruvec_ext,
+				struct scan_control *sc,
+				enum lru_list lru)
+{
+	/*
+	unsigned long nr_taken;
+	unsigned long nr_scanned;
+	unsigned long vm_flags;
+	unsigned long lock_flags;
+	LIST_HEAD(l_hold);	* The folios which were snipped off
+	LIST_HEAD(l_active);
+	LIST_HEAD(l_inactive);
+
+	// multi-clock
+	unsigned long nr_promote;
+	unsigned long pmem_page_sal = 0;
+	unsigned long active_to_promote = 0;
+	LIST_HEAD(l_promote);
+	// end multi-clock
+
+	unsigned nr_deactivate, nr_activate;
+	unsigned nr_rotated = 0;
+	int file = is_file_lru(lru);
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+
+	* make sure pages in per-cpu lru list are added
+	lru_add_drain();
+
+	spin_lock_irqsave(&lruvec->lru_lock, flags);
+
+	nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
+				     &nr_scanned, sc, lru);
+
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+
+	if (!cgroup_reclaim(sc))
+		__count_vm_events(PGREFILL, nr_scanned);
+	__count_memcg_events(lruvec_memcg(lruvec), PGREFILL, nr_scanned);
+
+	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
+
+	while (!list_empty(&l_hold)) {
+		struct folio *folio;
+
+		cond_resched();
+		folio = lru_to_folio(&l_hold);
+		list_del(&folio->lru);
+
+		if (unlikely(!folio_evictable(folio))) {
+			folio_putback_lru(folio);
+			continue;
+		}
+
+		if (unlikely(buffer_heads_over_limit)) {
+			if (folio_needs_release(folio) &&
+			    folio_trylock(folio)) {
+				filemap_release_folio(folio, 0);
+				folio_unlock(folio);
+			}
+		}
+
+		// MULTI-CLOCK
+		if (pgdat_ext->pm_node != 0) {
+			pmem_page_sal++;
+			if (page_referenced(page, 0, sc->target_mem_cgroup, & vm_flags)) {
+				//SetPagePromote(page); NEEDS TO BE MODULE TRACKED
+				list_add(&page->lru, &l_promote);
+				active_to_promote++;
+				continue;
+			}
+		}
+
+		// might not need, we only care about promoting here in the
+		// module
+		if (sc->only_promote) {
+			list_add(&page->lru, &l_active);
+		}
+		// END MULTI-CLOCK
+
+		* Referenced or rmap lock contention: rotate
+		if (folio_referenced(folio, 0, sc->target_mem_cgroup,
+				     &vm_flags) != 0) {
+			 *
+			 * Identify referenced, file-backed active folios and
+			 * give them one more trip around the active list. So
+			 * that executable code get better chances to stay in
+			 * memory under moderate memory pressure.  Anon folios
+			 * are not likely to be evicted by use-once streaming
+			 * IO, plus JVM can create lots of anon VM_EXEC folios,
+			 * so we ignore them here.
+			 *
+			if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio)) {
+				nr_rotated += folio_nr_pages(folio);
+				list_add(&folio->lru, &l_active);
+				continue;
+			}
+		}
+
+		folio_clear_active(folio);	* we are de-activating
+		folio_set_workingset(folio);
+		list_add(&folio->lru, &l_inactive);
+	}
+
+	 *
+	 * Move folios back to the lru list.
+	 *
+	spin_lock_irqsave(&lruvec->lru_lock, flags);
+
+	nr_activate = move_folios_to_lru(lruvec, &l_active);
+	nr_deactivate = move_folios_to_lru(lruvec, &l_inactive);
+
+	 * Keep all free folios in l_active list
+	list_splice(&l_inactive, &l_active);
+
+	__count_vm_events(PGDEACTIVATE, nr_deactivate);
+	__count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_deactivate);
+
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+
+	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
+
+	mem_cgroup_uncharge_list(&l_active);
+	free_unref_page_list(&l_active);
+	trace_mm_vmscan_lru_shrink_active(pgdat->node_id, nr_taken, nr_activate,
+			nr_deactivate, nr_rotated, sc->priority, file);
+	return;
+	*/
+	return;
+}
+
+
+/* SIMILAR TO: shrink_inactive_list() */
+static unsigned long scan_inactive_list(unsigned long nr_to_scan, 
+					struct lruvec_ext *lruvec_ext,
+					struct scan_control *sc,
+					enum lru_list lru)
+{
+	/*
+	LIST_HEAD(folio_list);
+	unsigned long nr_scanned;
+	unsigned int nr_reclaimed = 0;
+	unsigned long nr_taken;
+	int nr_migrated;
+	struct reclaim_stat stat;
+	bool file = is_file_lru(lru);
+	enum vm_event_item item;
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec_ext->lruvec);
+	struct pglist_data_ext *pgext = pglist_data_ext(lruvec_ext->lruvec);
+	bool stalled = false;
+
+	 * unlikely() checks if the branch is unlikely to be executed (branch
+	 * prediction).
+	 *
+	 * functions that need to be exposed or rewritten here:
+	 * 	too_many_isolated (rewrite, needs sc)
+	 * 	reclaim_throttle (expose using hook)
+	 * 	fatal_signal_pending (expose? from signal.h)
+	 *
+	while (unlikely(too_many_isolated(pgdat, file, sc))) {
+		if (stalled)
+			return 0;
+
+		* wait a bit for the reclaimer. 
+		stalled = true;
+		reclaim_throttle(pgdat, VMSCAN_THROTTLE_ISOLATED);
+
+		* We are about to die and free our memory. Return now.
+		if (fatal_signal_pending(current))
+			return SWAP_CLUSTER_MAX;
+	}
+
+	* make sure pages in per-cpu lru list are added
+	lru_add_drain();
+
+	 * We want to isolate the pages we are going to scan.
+	 *
+	 * functions that need to be exposed or rewritten here:
+	 * 	isolate_lru_folio / or pages? (rewrite)
+	 * 	
+	 *
+	spin_lock_irq(&lruvec_ext->lruvec->lru_lock);
+
+	nr_taken = isolate_lru_folios(nr_to_scan, lruvec_ext->lruvec, &folio_list,
+				     &nr_scanned, sc, lru);
+
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+	item = current_is_kswapd() ? PGSCAN_KSWAPD : PGSCAN_DIRECT;
+	if (!cgroup_reclaim(sc))
+		__count_vm_events(item, nr_scanned);
+	__count_memcg_events(lruvec_memcg(lruvec_ext->lruvec), item, nr_scanned);
+	__count_vm_events(PGSCAN_ANON + file, nr_scanned);
+
+	spin_unlock_irq(&lruvec_ext->lruvec->lru_lock);
+
+	if (nr_taken == 0) return 0;
+
+	// MULTI-CLOCK
+	if (pgext->pmem_node == 0) {
+		int ret = migrate_pages(&folio_list, vmscan_alloc_pmem_page, NULL, 
+								0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG);
+		nr_reclaimed = (ret >= 0 ? nr_taken - ret : 0);
+		__mod_node_page_state(pgdat, NR_DEMOTED, nr_reclaimed);
+	}
+	// END MULTI-CLOCK
+
+	nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, false);
+
+	spin_lock_irq(&lruvec_ext->lruvec->lru_lock);
+	move_folios_to_lru(lruvec_ext->lruvec, &folio_list);
+
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+	item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
+	if (!cgroup_reclaim(sc))
+		__count_vm_events(item, nr_reclaimed);
+	__count_memcg_events(lruvec_memcg(lruvec_ext->lruvec), item, nr_reclaimed);
+	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
+	spin_unlock_irq(&lruvec_ext->lruvec->lru_lock);
+
+	lru_note_cost(lruvec_ext->lruvec, file, stat.nr_pageout);
+	mem_cgroup_uncharge_list(&folio_list);
+	free_unref_page_list(&folio_list);
+
+	 * If dirty pages are scanned that are not queued for IO, it
+	 * implies that flushers are not doing their job. This can
+	 * happen when memory pressure pushes dirty pages to the end of
+	 * the LRU before the dirty limits are breached and the dirty
+	 * data has expired. It can also happen when the proportion of
+	 * dirty pages grows not through writes but through memory
+	 * pressure reclaiming all the clean cache. And in some cases,
+	 * the flushers simply cannot keep up with the allocation
+	 * rate. Nudge the flusher threads in case they are asleep.
+	 *
+	if (stat.nr_unqueued_dirty == nr_taken) {
+		wakeup_flusher_threads(WB_REASON_VMSCAN);
+		 *
+		 * For cgroupv1 dirty throttling is achieved by waking up
+		 * the kernel flusher here and later waiting on folios
+		 * the kernel flusher here and later waiting on pages
+		 * which are in writeback to finish (see shrink_folio_list()).
+		 *
+		 * Flusher may not be able to issue writeback quickly
+		 * enough for cgroupv1 writeback throttling to work
+		 * on a large system.
+		 *
+		 * NEED TO REWRITE: writeback_throttling_sane()
+		 * EXPOSE USING HOOKS: reclaim_throttle()
+		 *
+		if (!writeback_throttling_sane(sc))
+			reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
+	}
+
+	// possibly remove or rewrite this portion
+	// if we dont reclaim, then we don't have these
+	sc->nr.dirty += stat.nr_dirty;
+	sc->nr.congested += stat.nr_congested;
+	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
+	sc->nr.writeback += stat.nr_writeback;
+	sc->nr.immediate += stat.nr_immediate;
+	sc->nr.taken += nr_taken;
+	if (file)
+		sc->nr.file_taken += nr_taken;
+
+	// same here, if we didn't reclaim anything, then why?
+	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
+			nr_scanned, nr_reclaimed, &stat, sc->priority, file);
+
+	return nr_migrated;
+	*/
+	return 0;
+}
+
+
+/* SIMILAR TO: shrink_list() */
+static unsigned long scan_lru_list(enum lru_list lru, 
+				unsigned long nr_to_scan,
+				struct lruvec_ext *lruvec_ext, 
+				struct scan_control *sc)
+{
+	if (is_active_lru(lru))
+		scan_active_list(nr_to_scan, lruvec_ext, sc, lru);
+
+	return scan_inactive_list(nr_to_scan, lruvec_ext, sc, lru);
+}
+
+
+/* similar to: shrink_lruvec() 
+ * 
+ * This might later consume scan_lru_list(), as it might be more simple to put
+ * its code here instead.
+ */
+static void scan_lruvec(struct lruvec_ext *lruvec_ext, struct scan_control *sc)
+{
+	enum lru_list lru;
+
+	// we need to determine this number dynamically later
+	unsigned long nr_to_scan = 1024;
+
+	for_each_evictable_lru(lru) {
+		scan_lru_list(lru, nr_to_scan, lruvec_ext, sc);
+	}
+}
+
 
 /* need to acquire spinlock before calling this function */
 
@@ -287,6 +502,7 @@ bool watching_zonetype(struct zone *z)
  * pageflags enum in page-flags.h. Bit related operations
  * are found in bitops.h.
  */
+/*
 static unsigned int scan_lru_list(struct list_head *list)
 {
 	struct page *page, *next;
@@ -302,6 +518,7 @@ static unsigned int scan_lru_list(struct list_head *list)
 
 	return nr_page_refs;
 }
+*/
 
 
 /**
@@ -332,24 +549,69 @@ static unsigned int scan_lru_list(struct list_head *list)
  * struct lru_list, struct lruvec [src/include/mmzone.h]
  * struct mem_cgroup, mem_cgroup_iter() [src/include/memcontrol.h]
  */
-static void scan_node(pg_data_t *pgdat, int nid)
+static void scan_node(pg_data_t *pgdat)
 {
-	enum lru_list lru;
+	//enum lru_list lru;
+	struct zone *zone;
 	struct mem_cgroup *memcg;
-	struct mem_cgroup *root;
 	struct lruvec *lruvec;
+	struct lruvec_ext lruvec_ext;
+	int nid = pgdat->node_id;
+	int z = 0;
 
-	pr_info("scanning lists on node %d", nid);
+	//struct reclaim_state reclaim_state = {
+	//	.reclaimed_slab = 0,
+	//};
+
+	struct mem_cgroup_reclaim_cookie reclaim = {
+		.pgdat = pgdat,
+	};
+
+	struct scan_control sc = {
+		//.nr_to_reclaim = SWAP_CLUSTER_MAX,
+		.nr_to_reclaim = 0,
+		.gfp_mask = TMEMD_GFP_FLAGS,
+		.priority = DEF_PRIORITY,
+		.may_writepage = !laptop_mode, //do not delay writing to disk
+		.may_unmap = 1,
+		.may_swap = 1,
+		.reclaim_idx = MAX_NR_ZONES - 1,
+		.target_mem_cgroup = NULL,
+	};
+
+	memset(&sc.nr, 0, sizeof(sc.nr));
+
+	/* move number of pages proportional to number of zones */
+	for (z = 0; z <= sc.reclaim_idx; z++) {
+		zone = pgdat->node_zones + z;
+		if (!managed_zone(zone))
+			continue;
+
+		sc.nr_to_reclaim += max(high_wmark_pages(zone), SWAP_CLUSTER_MAX);
+	}
+
+	// needs exposed to the module
+	//set_task_reclaim_state(current, &reclaim_state);
+	//task->reclaim_state = &reclaim_state;
 
 	// get memory cgroup for the node
 	// tmem_cgroup_iter() = mem_cgroup_iter()
-	root = NULL;
-	memcg = ktmm_mem_cgroup_iter(root, NULL, NULL);
+	memcg = ktmm_mem_cgroup_iter(sc.target_mem_cgroup, NULL, &reclaim);
 	
 	// acquire the lruvec structure
 	lruvec = &memcg->nodeinfo[nid]->lruvec;
+
+	//will eventually replace the statement above
+	lruvec_ext.lruvec = lruvec;
 	
+	pr_info("scanning lists on node %d", nid);
+
+
+	//NEEDED: code to determine if we can claim pages
+	//shrink_lruvec_memcg()
+
 	// scan the LRU lists
+	/*
 	for_each_evictable_lru(lru) 
 	{
 		unsigned int ref_count;
@@ -364,6 +626,11 @@ static void scan_node(pg_data_t *pgdat, int nid)
 		
 		spin_unlock_irqrestore(&lruvec->lru_lock, flags);
 	}
+	*/
+
+	scan_lruvec(&lruvec_ext, &sc);
+
+	//scan promote list here
 }
 
 
@@ -446,15 +713,13 @@ static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
 static int tmemd(void *p) 
 {
 	pg_data_t *pgdat = (pg_data_t *)p;
-	int nid = READ_ONCE(pgdat->node_id);
-	struct task_struct *tsk = current;
-	const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
-
-	pr_debug("tmemd started on node %d", nid);
+	int nid = pgdat->node_id;
+	struct task_struct *task = current;
+	const struct cpumask *cpumask = cpumask_of_node(nid);
 
 	// Only allow node's CPUs to run this task
 	if(!cpumask_empty(cpumask))
-		set_cpus_allowed_ptr(tsk, cpumask);
+		set_cpus_allowed_ptr(task, cpumask);
 
 	/*
 	 * Tell MM that we are a memory allocator, and that we are actually
@@ -462,7 +727,10 @@ static int tmemd(void *p)
 	 *
 	 * Flags are located in include/sched.h for more info.
 	 */
-	tsk->flags |= PF_MEMALLOC | PF_KSWAPD;
+	task->flags |= PF_MEMALLOC | PF_KSWAPD;
+
+
+	pr_debug("tmemd started on node %d", nid);
 
 	/*
 	 * Loop every few seconds and scan the node's LRU lists.
@@ -470,7 +738,7 @@ static int tmemd(void *p)
 	 */
 	for ( ; ; )
 	{
-		scan_node(pgdat, nid);
+		scan_node(pgdat);
 
 		if(kthread_should_stop()) break;
 		
@@ -480,7 +748,8 @@ static int tmemd(void *p)
 		
 	}
 
-	tsk->flags &= ~(PF_MEMALLOC | PF_KSWAPD);
+	task->flags &= ~(PF_MEMALLOC | PF_KSWAPD);
+	current->reclaim_state = NULL;
 	
 	return 0;
 }
@@ -521,7 +790,7 @@ static int wmark_watchdogd(void *p)
 	bool ok;
 
 	do {
-		ktmm_for_each_populated_zone(zone) {
+		for_each_observed_zone(zone) {
 
 			highest_zoneidx = gfp_zone(flags);
 			watermark = high_wmark_pages(zone);
@@ -550,6 +819,10 @@ static int wmark_watchdogd(void *p)
 }
 
 
+/*****************************************************************************
+ * Start & Stop
+ *****************************************************************************/
+
 /**
  * Daemons are only started on online/active nodes. They are
  * currently stored in a local list, but will later need to be
@@ -567,27 +840,28 @@ int tmemd_start_available(void)
 {
 	int i;
 	int nid;
-	int ret;
+	//int ret;
 
 	pr_debug("starting tmemd on available nodes");
 	
 	/* initialize wait queues for sleeping */
 	for (i = 0; i < MAX_NUMNODES; i++)
 		init_waitqueue_head(&tmemd_wait[i]);
-	
-	ret = install_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
+
+	//ret = install_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 	
 	for_each_online_node(nid)
 	{
 		pg_data_t *pgdat = NODE_DATA(nid);
-		
+		init_node_data_ext(nid);
+
         	tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
 	}
 
 	/* start the watermark watchdog */
 	wd = kthread_run(&wmark_watchdogd, NULL, "wmark_watchdogd");
 
-	return ret;
+	return 0;
 }
 
 
@@ -607,6 +881,7 @@ void tmemd_stop_all(void)
 	/* start the watermark watchdog */
 	kthread_stop(wd);
 
-	uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
+	//uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 }
+
 
