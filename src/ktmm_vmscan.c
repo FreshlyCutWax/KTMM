@@ -9,8 +9,9 @@
 #include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
-#include <linux/gfp.h>
 #include <linux/freezer.h>
+#include <linux/gfp.h>
+#include <linux/hashtable.h> //***
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/kthread.h>
@@ -32,14 +33,9 @@
 
 #include "ktmm_hook.h"
 #include "ktmm_vmscan.h"
-#include "ktmm_mm.h"
-#include "ktmm_vmhooks.h"
 
 // possibly needs to be GFP_USER?
 #define TMEMD_GFP_FLAGS GFP_NOIO
-
-struct pglist_data_ext node_data_ext[MAX_NUMNODES];
-
 
 // Temporary list to hold references to tmem daemons.
 // Replace kswapd task_struct in pglist_data?
@@ -56,6 +52,116 @@ wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 // zones we care about watermarks & moving pages
 // ZONE_NORMAL, ZONE_HIGHMEM
 const int ktmm_zone_watchlist[] = {2, 3};
+
+
+//promote list hash table
+DEFINE_HASHTABLE(promote_vec, 10);
+
+/*
+struct page* vmscan_alloc_pmem_page(struct  page *page, unsigned long data)
+{
+		gfp_t gfp_mask = GFP_USER | __GFP_PMEM;
+		//return alloc_pages_node(pmem_node_id, gfp_mask, 0);
+		return alloc_page(gfp_mask);
+}
+
+struct page* vmscan_alloc_normal_page(struct page *page, unsigned long data)
+{
+        gfp_t gfp_mask = GFP_USER;
+        return alloc_page(gfp_mask);
+}
+*/
+
+/************** IMPORTED/HOOKED PROTOTYPES HERE *****************************/
+static struct mem_cgroup *(*pt_mem_cgroup_iter)(struct mem_cgroup *root,
+				struct mem_cgroup *prev,
+				struct mem_cgroup_reclaim_cookie *reclaim);
+
+
+/* FROM: page_alloc.c */
+static bool (*pt_zone_watermark_ok_safe)(struct zone *z,
+					unsigned int order,
+					unsigned long mark,
+					int highest_zoneidx);
+
+
+/* FROM: mmzone.c */
+static struct pglist_data *(*pt_first_online_pgdat)(void);
+
+
+/* FROM: mmzone.c */
+static struct zone *(*pt_next_zone)(struct zone *zone);
+
+
+/**************** END IMPORTED/HOOKED PROTOTYPES *****************************/
+static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
+				struct mem_cgroup *prev,
+				struct mem_cgroup_reclaim_cookie *reclaim)
+{
+	return pt_mem_cgroup_iter(root, prev, reclaim);
+}
+
+
+static bool ktmm_zone_watermark_ok_safe(struct zone *z,
+					unsigned int order,
+					unsigned long mark,
+					int highest_zoneidx)
+{
+	return pt_zone_watermark_ok_safe(z, order, mark, highest_zoneidx);
+}
+
+
+static struct pglist_data *ktmm_first_online_pgdat(void)
+{
+	return pt_first_online_pgdat();
+}
+
+
+static struct zone *ktmm_next_zone(struct zone *zone)
+{
+	return pt_next_zone(zone);
+}
+
+
+/*****************************************************************************
+ * NODE & LRUVEC
+ *****************************************************************************/
+
+enum lru_promote_list {
+    LRU_PROMOTE_ANON_LIST = 0,
+    LRU_PROMOTE_FILE_LIST = 1,
+    NR_PROMOTE_LISTS,
+};
+
+
+struct promote_lru_lists {
+	struct list_head promote_anon_list;
+	struct list_head promote_file_list;
+
+	spinlock_t lock;
+	struct hlist_node hnode;
+	unsigned long key;
+};
+
+
+struct promote_lists *get_promote_lists(struct mem_cgroup *memcg)
+{
+	struct promote_lru_lists *entry;
+	unsigned long key = (unsigned long) memcg;
+
+	/* try to get existing promote lists */
+	hash_for_each_possible(promote_vec, entry, hnode, key) {
+		if (entry->key == key) return entry;
+	}
+
+	
+	/* if the promote lists do not exist, make them */
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+}
+
+
+/* get the next page/folio in the list */
+#define lru_to_page_next(head) (list_entry((head)->next, struct page, lru))
 
 
 /*****************************************************************************
@@ -175,7 +281,7 @@ static void shrink_promotion_list(unsigned long nr_to_scan,
 
 /* SIMILAR TO: shrink_active_list */
 static void scan_active_list(unsigned long nr_to_scan, 
-				struct lruvec_ext *lruvec_ext,
+				struct lruvec *lruvec,
 				struct scan_control *sc,
 				enum lru_list lru)
 {
@@ -308,7 +414,7 @@ static void scan_active_list(unsigned long nr_to_scan,
 
 /* SIMILAR TO: shrink_inactive_list() */
 static unsigned long scan_inactive_list(unsigned long nr_to_scan, 
-					struct lruvec_ext *lruvec_ext,
+					struct lruvec *lruvec,
 					struct scan_control *sc,
 					enum lru_list lru)
 {
@@ -450,13 +556,13 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 /* SIMILAR TO: shrink_list() */
 static unsigned long scan_lru_list(enum lru_list lru, 
 				unsigned long nr_to_scan,
-				struct lruvec_ext *lruvec_ext, 
+				struct lruvec *lruvec, 
 				struct scan_control *sc)
 {
 	if (is_active_lru(lru))
-		scan_active_list(nr_to_scan, lruvec_ext, sc, lru);
+		scan_active_list(nr_to_scan, lruvec, sc, lru);
 
-	return scan_inactive_list(nr_to_scan, lruvec_ext, sc, lru);
+	return scan_inactive_list(nr_to_scan, lruvec, sc, lru);
 }
 
 
@@ -465,7 +571,7 @@ static unsigned long scan_lru_list(enum lru_list lru,
  * This might later consume scan_lru_list(), as it might be more simple to put
  * its code here instead.
  */
-static void scan_lruvec(struct lruvec_ext *lruvec_ext, struct scan_control *sc)
+static void scan_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 {
 	enum lru_list lru;
 
@@ -473,7 +579,7 @@ static void scan_lruvec(struct lruvec_ext *lruvec_ext, struct scan_control *sc)
 	unsigned long nr_to_scan = 1024;
 
 	for_each_evictable_lru(lru) {
-		scan_lru_list(lru, nr_to_scan, lruvec_ext, sc);
+		scan_lru_list(lru, nr_to_scan, lruvec, sc);
 	}
 }
 
@@ -555,7 +661,7 @@ static void scan_node(pg_data_t *pgdat)
 	struct zone *zone;
 	struct mem_cgroup *memcg;
 	struct lruvec *lruvec;
-	struct lruvec_ext lruvec_ext;
+	int count;
 	int nid = pgdat->node_id;
 	int z = 0;
 
@@ -601,11 +707,16 @@ static void scan_node(pg_data_t *pgdat)
 	// acquire the lruvec structure
 	lruvec = &memcg->nodeinfo[nid]->lruvec;
 
-	//will eventually replace the statement above
-	lruvec_ext.lruvec = lruvec;
-	
 	pr_info("scanning lists on node %d", nid);
 
+	pr_info("Counting memory cgroups...");
+	count = 0;
+	do {
+		count += 1;
+		pr_info("Count: %d", count);
+	} while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
+
+	pr_debug("memcg count: %d", count);
 
 	//NEEDED: code to determine if we can claim pages
 	//shrink_lruvec_memcg()
@@ -628,7 +739,7 @@ static void scan_node(pg_data_t *pgdat)
 	}
 	*/
 
-	scan_lruvec(&lruvec_ext, &sc);
+	scan_lruvec(lruvec, &sc);
 
 	//scan promote list here
 }
@@ -823,6 +934,15 @@ static int wmark_watchdogd(void *p)
  * Start & Stop
  *****************************************************************************/
 
+/****************** ADD VMSCAN HOOKS HERE ************************/
+static struct ktmm_hook vmscan_hooks[] = {
+	HOOK("mem_cgroup_iter", ktmm_mem_cgroup_iter, &pt_mem_cgroup_iter),
+	HOOK("zone_watermark_ok", ktmm_zone_watermark_ok_safe, &pt_zone_watermark_ok_safe),
+	HOOK("first_online_pgdat", ktmm_first_online_pgdat, &pt_first_online_pgdat),
+	HOOK("next_zone", ktmm_next_zone, &pt_next_zone),
+};
+
+
 /**
  * Daemons are only started on online/active nodes. They are
  * currently stored in a local list, but will later need to be
@@ -840,7 +960,7 @@ int tmemd_start_available(void)
 {
 	int i;
 	int nid;
-	//int ret;
+	int ret;
 
 	pr_debug("starting tmemd on available nodes");
 	
@@ -848,12 +968,11 @@ int tmemd_start_available(void)
 	for (i = 0; i < MAX_NUMNODES; i++)
 		init_waitqueue_head(&tmemd_wait[i]);
 
-	//ret = install_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
+	ret = install_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 	
 	for_each_online_node(nid)
 	{
 		pg_data_t *pgdat = NODE_DATA(nid);
-		init_node_data_ext(nid);
 
         	tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
 	}
@@ -861,7 +980,7 @@ int tmemd_start_available(void)
 	/* start the watermark watchdog */
 	wd = kthread_run(&wmark_watchdogd, NULL, "wmark_watchdogd");
 
-	return 0;
+	return ret;
 }
 
 
@@ -881,7 +1000,7 @@ void tmemd_stop_all(void)
 	/* start the watermark watchdog */
 	kthread_stop(wd);
 
-	//uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
+	uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 }
 
 

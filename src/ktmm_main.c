@@ -14,7 +14,6 @@
 #include <linux/version.h>
 
 #include "ktmm_vmscan.h"
-#include "ktmm_vmhooks.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jared Draper, Josh Borthick, Grant Wilke, Camilo Palomino");
@@ -29,7 +28,6 @@ static int __init tmem_init(void) {
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,1,0)
 	pr_info("Module initializing..\n");
-	install_vmscan_hooks();
 	ret = tmemd_start_available();
 #else
 	ret = -EFAULT;
@@ -46,7 +44,6 @@ static int __init tmem_init(void) {
 static void __exit tmem_exit(void) {
 	pr_info("Module exiting..\n");
 	tmemd_stop_all();
-	uninstall_vmscan_hooks();
 }
 
 
