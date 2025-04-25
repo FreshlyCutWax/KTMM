@@ -8,6 +8,7 @@
 
 #include <linux/atomic.h>
 #include <linux/bitops.h>
+#include <linux/cgroup.h>
 #include <linux/delay.h>
 #include <linux/freezer.h>
 #include <linux/gfp.h>
@@ -93,6 +94,9 @@ static struct pglist_data *(*pt_first_online_pgdat)(void);
 static struct zone *(*pt_next_zone)(struct zone *zone);
 
 
+static void (*pt_mem_cgroup_css_free)(struct cgroup_subsys_state *css);
+
+
 /**************** END IMPORTED/HOOKED PROTOTYPES *****************************/
 static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
 				struct mem_cgroup *prev,
@@ -149,25 +153,25 @@ static struct promote_lists *lruvec_promote_lists(struct lruvec *lruvec)
 	struct promote_lists *entry;
 	unsigned long key = (unsigned long) lruvec;
 
-	/* try to get existing promote lists */
+	// try to get existing promote lists 
 	hash_for_each_possible(promote_vec, entry, hnode, key) {
 		if (entry->key == key) return entry;
 	}
 	
-	/* if the promote lists do not exist, create them */
+	// if the promote lists do not exist, create them 
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry) {
 		kfree(entry);
 		return NULL;
 	}
 
-	/* initialize struct elements */
+	// initialize struct elements
 	INIT_LIST_HEAD(&entry->anon_list);
 	INIT_LIST_HEAD(&entry->file_list);
 	spin_lock_init(&entry->lock);
 	entry->key = key;
 
-	/* add lists to hash table */
+	// add lists to hash table
 	hash_add(promote_vec, &entry->hnode, key);
 
 	return entry;
@@ -175,12 +179,48 @@ static struct promote_lists *lruvec_promote_lists(struct lruvec *lruvec)
 
 
 /* called when cgroup is freed */
-/*
-static int promote_lists_free(struct mem_cgroup *memcg)
+static void promote_lists_free(struct mem_cgroup *memcg)
 {
-	return 0;
+	int nid;
+	struct lruvec *lruvec;
+	struct mem_cgroup_per_node *memcg_pn;
+	struct promote_lists *entry;
+	unsigned long key;
+
+	for_each_online_node(nid) {
+		memcg_pn = memcg->nodeinfo[nid];
+
+		if (!memcg_pn) continue;
+
+		lruvec = &memcg_pn->lruvec;
+		key = (unsigned long) lruvec;
+		
+		hash_for_each_possible(promote_vec, entry, hnode, key) {
+
+			if (entry->key == key) {
+				spin_lock(&entry->lock);
+
+				//check page references free pages
+
+				spin_unlock(&entry->lock);
+
+				// free allocated list
+				kfree(entry);
+			}
+		}
+	}
 }
-*/
+
+
+/* This is a hooked function */
+static void ktmm_mem_cgroup_css_free(struct cgroup_subsys_state *css)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+	promote_lists_free(memcg);
+
+	pt_mem_cgroup_css_free(css);
+}
+
 
 /*
 static int move_promote_to_active(struct lruvec *lruvec, 
@@ -198,14 +238,13 @@ static int move_promote_to_active(struct lruvec *lruvec,
 
 
 /* called on exit to move pages back to kernel lru lists */
-static int remove_promote_lists(struct lruvec *lruvec, int nid)
+static int remove_promote_lists(struct lruvec *lruvec)
 {
 	struct promote_lists *entry;
 	unsigned long key = (unsigned long) lruvec;
 
 	// try to get promote lists if they existed
 	hash_for_each_possible(promote_vec, entry, hnode, key) {
-		//int flags;
 
 		if (entry->key == key) {
 			spin_lock(&lruvec->lru_lock);
@@ -765,18 +804,19 @@ static void scan_node(pg_data_t *pgdat)
 	//set_task_reclaim_state(current, &reclaim_state);
 	//task->reclaim_state = &reclaim_state;
 
-	// get memory cgroup for the node
-	// tmem_cgroup_iter() = mem_cgroup_iter()
+	// get the root memory cgroup
 	memcg = ktmm_mem_cgroup_iter(sc.target_mem_cgroup, NULL, &reclaim);
 	
-	// acquire the lruvec structure
-	lruvec = &memcg->nodeinfo[nid]->lruvec;
-
 	pr_info("scanning lists on node %d", nid);
 
 	pr_info("Counting memory cgroups...");
 	count = 0;
 	do {
+		// acquire the lruvec structure
+		lruvec = &memcg->nodeinfo[nid]->lruvec;
+
+		lruvec_promote_lists(lruvec);
+
 		count += 1;
 		pr_info("Count: %d", count);
 	} while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
@@ -807,6 +847,29 @@ static void scan_node(pg_data_t *pgdat)
 	scan_lruvec(lruvec, &sc);
 
 	//scan promote list here
+}
+
+
+static void cleanup_node_lists(pg_data_t *pgdat)
+{
+	struct mem_cgroup *memcg;
+	struct lruvec *lruvec;
+	int count;
+	int nid = pgdat->node_id;
+
+	// get the root memory cgroup
+	memcg = ktmm_mem_cgroup_iter(NULL, NULL, NULL);
+
+	count = 0;
+	do {
+		// acquire the lruvec structure
+		lruvec = &memcg->nodeinfo[nid]->lruvec;
+
+		remove_promote_lists(lruvec);
+
+		count += 1;
+		pr_debug("Removing lists: %d", count);
+	} while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
 }
 
 
@@ -924,6 +987,8 @@ static int tmemd(void *p)
 		
 	}
 
+	cleanup_node_lists(pgdat);
+
 	task->flags &= ~(PF_MEMALLOC | PF_KSWAPD);
 	current->reclaim_state = NULL;
 	
@@ -1005,6 +1070,7 @@ static struct ktmm_hook vmscan_hooks[] = {
 	HOOK("zone_watermark_ok", ktmm_zone_watermark_ok_safe, &pt_zone_watermark_ok_safe),
 	HOOK("first_online_pgdat", ktmm_first_online_pgdat, &pt_first_online_pgdat),
 	HOOK("next_zone", ktmm_next_zone, &pt_next_zone),
+	HOOK("mem_cgroup_css_free", ktmm_mem_cgroup_css_free, &pt_mem_cgroup_css_free),
 };
 
 
