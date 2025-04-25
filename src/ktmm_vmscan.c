@@ -38,6 +38,9 @@
 // possibly needs to be GFP_USER?
 #define TMEMD_GFP_FLAGS GFP_NOIO
 
+// which node is the pmem node
+int pmem_node = -1;
+
 // Temporary list to hold references to tmem daemons.
 // Replace kswapd task_struct in pglist_data?
 static struct task_struct *tmemd_list[MAX_NUMNODES];
@@ -97,6 +100,12 @@ static struct zone *(*pt_next_zone)(struct zone *zone);
 static void (*pt_mem_cgroup_css_free)(struct cgroup_subsys_state *css);
 
 
+static void (*pt_free_unref_page_list)(struct list_head *list);
+
+
+static void (*pt_lru_add_drain)(void);
+
+
 /**************** END IMPORTED/HOOKED PROTOTYPES *****************************/
 static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
 				struct mem_cgroup *prev,
@@ -124,6 +133,18 @@ static struct pglist_data *ktmm_first_online_pgdat(void)
 static struct zone *ktmm_next_zone(struct zone *zone)
 {
 	return pt_next_zone(zone);
+}
+
+
+static void ktmm_free_unref_page_list(struct list_head *list)
+{
+	return pt_free_unref_page_list(list);
+}
+
+
+static void ktmm_lru_add_drain(void)
+{
+	pt_lru_add_drain();
 }
 
 
@@ -533,138 +554,54 @@ static unsigned long scan_inactive_list(struct lruvec *lruvec,
 					struct scan_control *sc,
 					enum lru_list lru)
 {
-	/*
 	LIST_HEAD(folio_list);
-	unsigned long nr_scanned;
-	unsigned int nr_reclaimed = 0;
-	unsigned long nr_taken;
-	int nr_migrated;
-	struct reclaim_stat stat;
-	bool file = is_file_lru(lru);
-	enum vm_event_item item;
-	struct pglist_data *pgdat = lruvec_pgdat(lruvec_ext->lruvec);
-	struct pglist_data_ext *pgext = pglist_data_ext(lruvec_ext->lruvec);
-	bool stalled = false;
+	//unsigned long nr_scanned;
+	unsigned long nr_taken = 0;
+	unsigned long nr_migrated = 0;
+	//unsigned long nr_reclaimed = 0;
+	//isolate_mode_t isolate_mode = 0;
+	//bool file = is_file_lru(lru);
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	int nid = pgdat->node_id;
 
-	 * unlikely() checks if the branch is unlikely to be executed (branch
-	 * prediction).
-	 *
-	 * functions that need to be exposed or rewritten here:
-	 * 	too_many_isolated (rewrite, needs sc)
-	 * 	reclaim_throttle (expose using hook)
-	 * 	fatal_signal_pending (expose? from signal.h)
-	 *
-	while (unlikely(too_many_isolated(pgdat, file, sc))) {
-		if (stalled)
-			return 0;
+	// make sure pages in per-cpu lru list are added
+	ktmm_lru_add_drain();
 
-		* wait a bit for the reclaimer. 
-		stalled = true;
-		reclaim_throttle(pgdat, VMSCAN_THROTTLE_ISOLATED);
+	// We want to isolate the pages we are going to scan.
+	spin_lock_irq(&lruvec->lru_lock);
 
-		* We are about to die and free our memory. Return now.
-		if (fatal_signal_pending(current))
-			return SWAP_CLUSTER_MAX;
-	}
-
-	* make sure pages in per-cpu lru list are added
-	lru_add_drain();
-
-	 * We want to isolate the pages we are going to scan.
-	 *
-	 * functions that need to be exposed or rewritten here:
-	 * 	isolate_lru_folio / or pages? (rewrite)
-	 * 	
-	 *
-	spin_lock_irq(&lruvec_ext->lruvec->lru_lock);
-
+	/*
 	nr_taken = isolate_lru_folios(nr_to_scan, lruvec_ext->lruvec, &folio_list,
 				     &nr_scanned, sc, lru);
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
-	item = current_is_kswapd() ? PGSCAN_KSWAPD : PGSCAN_DIRECT;
-	if (!cgroup_reclaim(sc))
-		__count_vm_events(item, nr_scanned);
-	__count_memcg_events(lruvec_memcg(lruvec_ext->lruvec), item, nr_scanned);
-	__count_vm_events(PGSCAN_ANON + file, nr_scanned);
+	*/
 
-	spin_unlock_irq(&lruvec_ext->lruvec->lru_lock);
+	spin_unlock_irq(&lruvec->lru_lock);
 
 	if (nr_taken == 0) return 0;
 
-	// MULTI-CLOCK
-	if (pgext->pmem_node == 0) {
+	// migrate pages down to the pmem node
+	if (pmem_node == nid) {
+		/*
 		int ret = migrate_pages(&folio_list, vmscan_alloc_pmem_page, NULL, 
-								0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG);
-		nr_reclaimed = (ret >= 0 ? nr_taken - ret : 0);
+					0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG);
+		nr_migrated = (ret >= 0 ? nr_taken - ret : 0);
 		__mod_node_page_state(pgdat, NR_DEMOTED, nr_reclaimed);
+		*/
 	}
-	// END MULTI-CLOCK
 
-	nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, false);
-
-	spin_lock_irq(&lruvec_ext->lruvec->lru_lock);
-	move_folios_to_lru(lruvec_ext->lruvec, &folio_list);
-
+	spin_lock_irq(&lruvec->lru_lock);
+	/*
+	move_folios_to_lru(lruvec, &folio_list);
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
-	item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
-	if (!cgroup_reclaim(sc))
-		__count_vm_events(item, nr_reclaimed);
-	__count_memcg_events(lruvec_memcg(lruvec_ext->lruvec), item, nr_reclaimed);
-	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
-	spin_unlock_irq(&lruvec_ext->lruvec->lru_lock);
+	*/
+	spin_unlock_irq(&lruvec->lru_lock);
 
-	lru_note_cost(lruvec_ext->lruvec, file, stat.nr_pageout);
 	mem_cgroup_uncharge_list(&folio_list);
-	free_unref_page_list(&folio_list);
-
-	 * If dirty pages are scanned that are not queued for IO, it
-	 * implies that flushers are not doing their job. This can
-	 * happen when memory pressure pushes dirty pages to the end of
-	 * the LRU before the dirty limits are breached and the dirty
-	 * data has expired. It can also happen when the proportion of
-	 * dirty pages grows not through writes but through memory
-	 * pressure reclaiming all the clean cache. And in some cases,
-	 * the flushers simply cannot keep up with the allocation
-	 * rate. Nudge the flusher threads in case they are asleep.
-	 *
-	if (stat.nr_unqueued_dirty == nr_taken) {
-		wakeup_flusher_threads(WB_REASON_VMSCAN);
-		 *
-		 * For cgroupv1 dirty throttling is achieved by waking up
-		 * the kernel flusher here and later waiting on folios
-		 * the kernel flusher here and later waiting on pages
-		 * which are in writeback to finish (see shrink_folio_list()).
-		 *
-		 * Flusher may not be able to issue writeback quickly
-		 * enough for cgroupv1 writeback throttling to work
-		 * on a large system.
-		 *
-		 * NEED TO REWRITE: writeback_throttling_sane()
-		 * EXPOSE USING HOOKS: reclaim_throttle()
-		 *
-		if (!writeback_throttling_sane(sc))
-			reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
-	}
-
-	// possibly remove or rewrite this portion
-	// if we dont reclaim, then we don't have these
-	sc->nr.dirty += stat.nr_dirty;
-	sc->nr.congested += stat.nr_congested;
-	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
-	sc->nr.writeback += stat.nr_writeback;
-	sc->nr.immediate += stat.nr_immediate;
-	sc->nr.taken += nr_taken;
-	if (file)
-		sc->nr.file_taken += nr_taken;
-
-	// same here, if we didn't reclaim anything, then why?
-	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
-			nr_scanned, nr_reclaimed, &stat, sc->priority, file);
+	ktmm_free_unref_page_list(&folio_list);
 
 	return nr_migrated;
-	*/
-	return 0;
 }
 
 
@@ -1069,6 +1006,8 @@ static struct ktmm_hook vmscan_hooks[] = {
 	HOOK("first_online_pgdat", ktmm_first_online_pgdat, &pt_first_online_pgdat),
 	HOOK("next_zone", ktmm_next_zone, &pt_next_zone),
 	HOOK("mem_cgroup_css_free", ktmm_mem_cgroup_css_free, &pt_mem_cgroup_css_free),
+	HOOK("free_unref_page_list", ktmm_free_unref_page_list, &pt_free_unref_page_list),
+	HOOK("lru_add_drain", ktmm_lru_add_drain, &pt_lru_add_drain),
 };
 
 
