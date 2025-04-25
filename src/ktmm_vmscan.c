@@ -277,6 +277,7 @@ static int remove_promote_lists(struct lruvec *lruvec)
  * will remove most of the comments for the original members for conciseness.
  */
 struct scan_control {
+	unsigned long nr_to_scan;
 	unsigned long nr_to_reclaim;
 	nodemask_t	*nodemask;
 	struct mem_cgroup *target_mem_cgroup;
@@ -331,6 +332,7 @@ struct scan_control {
 	/* This context's GFP mask */
 	gfp_t gfp_mask;
 
+	unsigned long nr_lru_pages;
 	unsigned long nr_scanned;
 	unsigned long nr_reclaimed;
 
@@ -371,21 +373,31 @@ bool watching_zonetype(struct zone *z)
 			else
 
 
-/*
-static void shrink_promotion_list(unsigned long nr_to_scan,
-				struct lruvec *lruvec,
-				struct scan_control *sc,
-				enum lru_list lru)
+static bool ktmm_cgroup_below_low(struct mem_cgroup *memcg)
 {
-	// needs implementation
+	return READ_ONCE(memcg->memory.elow) >=
+		page_counter_read(&memcg->memory);
+}
+
+
+static bool ktmm_cgroup_below_min(struct mem_cgroup *memcg)
+{
+	return READ_ONCE(memcg->memory.emin) >=
+		page_counter_read(&memcg->memory);
+}
+
+
+static void scan_promotion_lists(struct lruvec *lruvec,
+				struct promote_lists *pr_lists,
+				struct scan_control *sc)
+{
 	return;
 }
-*/
 
 
 /* SIMILAR TO: shrink_active_list */
-static void scan_active_list(unsigned long nr_to_scan, 
-				struct lruvec *lruvec,
+static void scan_active_list(struct lruvec *lruvec,
+				struct promote_lists *pr_lists,
 				struct scan_control *sc,
 				enum lru_list lru)
 {
@@ -517,8 +529,7 @@ static void scan_active_list(unsigned long nr_to_scan,
 
 
 /* SIMILAR TO: shrink_inactive_list() */
-static unsigned long scan_inactive_list(unsigned long nr_to_scan, 
-					struct lruvec *lruvec,
+static unsigned long scan_inactive_list(struct lruvec *lruvec,
 					struct scan_control *sc,
 					enum lru_list lru)
 {
@@ -659,14 +670,14 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 
 /* SIMILAR TO: shrink_list() */
 static unsigned long scan_lru_list(enum lru_list lru, 
-				unsigned long nr_to_scan,
 				struct lruvec *lruvec, 
+				struct promote_lists *pr_lists,
 				struct scan_control *sc)
 {
 	if (is_active_lru(lru))
-		scan_active_list(nr_to_scan, lruvec, sc, lru);
+		scan_active_list(lruvec, pr_lists, sc, lru);
 
-	return scan_inactive_list(nr_to_scan, lruvec, sc, lru);
+	return scan_inactive_list(lruvec, sc, lru);
 }
 
 
@@ -675,15 +686,14 @@ static unsigned long scan_lru_list(enum lru_list lru,
  * This might later consume scan_lru_list(), as it might be more simple to put
  * its code here instead.
  */
-static void scan_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+static void scan_lruvec(struct lruvec *lruvec, 
+			struct promote_lists *pr_lists,
+			struct scan_control *sc)
 {
 	enum lru_list lru;
 
-	// we need to determine this number dynamically later
-	unsigned long nr_to_scan = 1024;
-
 	for_each_evictable_lru(lru) {
-		scan_lru_list(lru, nr_to_scan, lruvec, sc);
+		scan_lru_list(lru, lruvec, pr_lists, sc);
 	}
 }
 
@@ -762,16 +772,9 @@ static unsigned int scan_lru_list(struct list_head *list)
 static void scan_node(pg_data_t *pgdat)
 {
 	//enum lru_list lru;
-	struct zone *zone;
 	struct mem_cgroup *memcg;
-	struct lruvec *lruvec;
-	int count;
+	int memcg_count;
 	int nid = pgdat->node_id;
-	int z = 0;
-
-	//struct reclaim_state reclaim_state = {
-	//	.reclaimed_slab = 0,
-	//};
 
 	struct mem_cgroup_reclaim_cookie reclaim = {
 		.pgdat = pgdat,
@@ -779,26 +782,19 @@ static void scan_node(pg_data_t *pgdat)
 
 	struct scan_control sc = {
 		//.nr_to_reclaim = SWAP_CLUSTER_MAX,
+		.nr_to_scan = 1024,
 		.nr_to_reclaim = 0,
 		.gfp_mask = TMEMD_GFP_FLAGS,
 		.priority = DEF_PRIORITY,
 		.may_writepage = !laptop_mode, //do not delay writing to disk
 		.may_unmap = 1,
 		.may_swap = 1,
-		.reclaim_idx = MAX_NR_ZONES - 1,
+		//.reclaim_idx = MAX_NR_ZONES - 1,
+		.reclaim_idx = gfp_zone(TMEMD_GFP_FLAGS),
 		.target_mem_cgroup = NULL,
 	};
 
 	memset(&sc.nr, 0, sizeof(sc.nr));
-
-	/* move number of pages proportional to number of zones */
-	for (z = 0; z <= sc.reclaim_idx; z++) {
-		zone = pgdat->node_zones + z;
-		if (!managed_zone(zone))
-			continue;
-
-		sc.nr_to_reclaim += max(high_wmark_pages(zone), SWAP_CLUSTER_MAX);
-	}
 
 	// needs exposed to the module
 	//set_task_reclaim_state(current, &reclaim_state);
@@ -810,43 +806,45 @@ static void scan_node(pg_data_t *pgdat)
 	pr_info("scanning lists on node %d", nid);
 
 	pr_info("Counting memory cgroups...");
-	count = 0;
+	memcg_count = 0;
 	do {
-		// acquire the lruvec structure
-		lruvec = &memcg->nodeinfo[nid]->lruvec;
+		struct lruvec *lruvec = &memcg->nodeinfo[nid]->lruvec;
+		struct promote_lists *pr_lists = lruvec_promote_lists(lruvec);
+		unsigned long reclaimed;
+		unsigned long scanned;
 
-		lruvec_promote_lists(lruvec);
+		memcg_count += 1;
+		pr_info("Count: %d", memcg_count);
 
-		count += 1;
-		pr_info("Count: %d", count);
+		if (ktmm_cgroup_below_min(memcg)) {
+			/*
+			 * Hard protection.
+			 * If there is no reclaimable memory, OOM.
+			 */
+			continue;
+		} else if (ktmm_cgroup_below_low(memcg)) {
+			/*
+			 * Soft protection.
+			 * Respect the protection only as long as
+			 * there is an unprotected supply of 
+			 * reclaimable memory from other cgroups.
+			 */
+			if (!sc.memcg_low_reclaim) {
+				sc.memcg_low_skipped = 1;
+			}
+		}
+		// memcg_memory_event(memcg, MEMCG_LOW);
+		
+
+		reclaimed = sc.nr_reclaimed;
+		scanned = sc.nr_scanned;
+
+		scan_lruvec(lruvec, pr_lists, &sc);
+		scan_promotion_lists(lruvec, pr_lists, &sc);
+
+		pr_debug("memcg count: %d", memcg_count);
+
 	} while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
-
-	pr_debug("memcg count: %d", count);
-
-	//NEEDED: code to determine if we can claim pages
-	//shrink_lruvec_memcg()
-
-	// scan the LRU lists
-	/*
-	for_each_evictable_lru(lru) 
-	{
-		unsigned int ref_count;
-		unsigned long flags;
-		struct list_head *list;
-		list = &lruvec->lists[lru];
-		
-		spin_lock_irqsave(&lruvec->lru_lock, flags);
-		
-		// call list_scan function
-		ref_count = scan_lru_list(list);
-		
-		spin_unlock_irqrestore(&lruvec->lru_lock, flags);
-	}
-	*/
-
-	scan_lruvec(lruvec, &sc);
-
-	//scan promote list here
 }
 
 
@@ -854,21 +852,21 @@ static void cleanup_node_lists(pg_data_t *pgdat)
 {
 	struct mem_cgroup *memcg;
 	struct lruvec *lruvec;
-	int count;
+	int memcg_count;
 	int nid = pgdat->node_id;
 
 	// get the root memory cgroup
 	memcg = ktmm_mem_cgroup_iter(NULL, NULL, NULL);
 
-	count = 0;
+	memcg_count = 0;
 	do {
 		// acquire the lruvec structure
 		lruvec = &memcg->nodeinfo[nid]->lruvec;
 
 		remove_promote_lists(lruvec);
 
-		count += 1;
-		pr_debug("Removing lists: %d", count);
+		memcg_count += 1;
+		pr_debug("Removing lists: %d", memcg_count);
 	} while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
 }
 
