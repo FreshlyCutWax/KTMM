@@ -134,9 +134,9 @@ enum lru_promote_list {
 };
 
 
-struct promote_lru_lists {
-	struct list_head promote_anon_list;
-	struct list_head promote_file_list;
+struct promote_lists {
+	struct list_head anon_list;
+	struct list_head file_list;
 
 	spinlock_t lock;
 	struct hlist_node hnode;
@@ -144,19 +144,84 @@ struct promote_lru_lists {
 };
 
 
-struct promote_lists *get_promote_lists(struct mem_cgroup *memcg)
+static struct promote_lists *lruvec_promote_lists(struct lruvec *lruvec)
 {
-	struct promote_lru_lists *entry;
-	unsigned long key = (unsigned long) memcg;
+	struct promote_lists *entry;
+	unsigned long key = (unsigned long) lruvec;
 
 	/* try to get existing promote lists */
 	hash_for_each_possible(promote_vec, entry, hnode, key) {
 		if (entry->key == key) return entry;
 	}
-
 	
-	/* if the promote lists do not exist, make them */
+	/* if the promote lists do not exist, create them */
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry) {
+		kfree(entry);
+		return NULL;
+	}
+
+	/* initialize struct elements */
+	INIT_LIST_HEAD(&entry->anon_list);
+	INIT_LIST_HEAD(&entry->file_list);
+	spin_lock_init(&entry->lock);
+	entry->key = key;
+
+	/* add lists to hash table */
+	hash_add(promote_vec, &entry->hnode, key);
+
+	return entry;
+}
+
+
+/* called when cgroup is freed */
+/*
+static int promote_lists_free(struct mem_cgroup *memcg)
+{
+	return 0;
+}
+*/
+
+/*
+static int move_promote_to_active(struct lruvec *lruvec, 
+					struct list_head *list)
+{
+	struct folio *folio, *next;
+
+	lruvec = &memcg->nodeinfo[nid]->lruvec;
+	
+	list_for_each(folio, next, list) {
+		
+	}
+}
+*/
+
+
+/* called on exit to move pages back to kernel lru lists */
+static int remove_promote_lists(struct lruvec *lruvec, int nid)
+{
+	struct promote_lists *entry;
+	unsigned long key = (unsigned long) lruvec;
+
+	// try to get promote lists if they existed
+	hash_for_each_possible(promote_vec, entry, hnode, key) {
+		//int flags;
+
+		if (entry->key == key) {
+			spin_lock(&lruvec->lru_lock);
+			spin_lock(&entry->lock);
+
+			//move_promote_to_active(lruvec, &entry->anon_list);
+			//move_promote_to_active(lruvec, &entry->anon_list);
+
+			spin_unlock(&entry->lock);
+			spin_unlock(&lruvec->lru_lock);
+
+			// free allocated list
+			kfree(entry);
+		}
+	}
+	return 0;
 }
 
 
