@@ -736,7 +736,8 @@ static void scan_node(pg_data_t *pgdat,
 	int memcg_count;
 
 	memset(&sc->nr, 0, sizeof(sc->nr));
-	ktmm_mem_cgroup_iter(NULL, NULL, reclaim);
+	memcg = ktmm_mem_cgroup_iter(NULL, NULL, reclaim);
+	sc->target_mem_cgroup = memcg;
 
 	pr_info("scanning lists on node %d", nid);
 	pr_info("Counting memory cgroups...");
