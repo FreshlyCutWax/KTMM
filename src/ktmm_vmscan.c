@@ -106,6 +106,13 @@ static void (*pt_free_unref_page_list)(struct list_head *list);
 static void (*pt_lru_add_drain)(void);
 
 
+static void (*pt_cgroup_update_lru_size)(struct lruvec *lruvec, enum lru_list lru,
+					int zid, int nr_pages);
+
+
+static void (*pt_cgroup_uncharge_list)(struct list_head *page_list);
+
+
 /**************** END IMPORTED/HOOKED PROTOTYPES *****************************/
 static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
 				struct mem_cgroup *prev,
@@ -145,6 +152,19 @@ static void ktmm_free_unref_page_list(struct list_head *list)
 static void ktmm_lru_add_drain(void)
 {
 	pt_lru_add_drain();
+}
+
+
+static void ktmm_cgroup_update_lru_size(struct lruvec *lruvec, enum lru_list lru,
+					int zid, int nr_pages)
+{
+	pt_cgroup_update_lru_size(lruvec, lru, zid, nr_pages);
+}
+
+
+static void ktmm_cgroup_uncharge_list(struct list_head *page_list)
+{
+	pt_cgroup_uncharge_list(page_list);
 }
 
 
@@ -315,20 +335,18 @@ struct scan_control {
 	unsigned int may_swap:1;
 	unsigned int proactive:1;
 
-	/*
-	 * Cgroup memory below memory.low is protected as long as we
-	 * don't threaten to OOM. If any cgroup is reclaimed at
-	 * reduced force or passed over entirely due to its memory.low
-	 * setting (memcg_low_skipped), and nothing is reclaimed as a
-	 * result, then go back for one more cycle that reclaims the protected
-	 * memory (memcg_low_reclaim) to avert OOM.
-	 */
+	 //* Cgroup memory below memory.low is protected as long as we
+	 //* don't threaten to OOM. If any cgroup is reclaimed at
+	 //* reduced force or passed over entirely due to its memory.low
+	 //* setting (memcg_low_skipped), and nothing is reclaimed as a
+	 //* result, then go back for one more cycle that reclaims the protected
+	 //* memory (memcg_low_reclaim) to avert OOM.
 	unsigned int memcg_low_reclaim:1;
 	unsigned int memcg_low_skipped:1;
 	unsigned int hibernation_mode:1;
 	unsigned int compaction_ready:1;
 
-	/* Searching for pages to promote */
+	// Searching for pages to promote
 	unsigned int only_promote:1;
 
 	unsigned int cache_trim_mode:1;
@@ -336,21 +354,21 @@ struct scan_control {
 	unsigned int no_demotion:1;
 
 #ifdef CONFIG_LRU_GEN
-	/* help kswapd make better choices among multiple memcgs */
+	// help kswapd make better choices among multiple memcgs
 	unsigned int memcgs_need_aging:1;
 	unsigned long last_reclaimed;
 #endif
 
-	/* Allocation order */
+	// Allocation order
 	s8 order;
 
-	/* Scan (total_size >> priority) pages at once */
+	// Scan (total_size >> priority) pages at once
 	s8 priority;
 
-	/* The highest zone to isolate folios for reclaim from */
+	// The highest zone to isolate folios for reclaim from
 	s8 reclaim_idx;
 
-	/* This context's GFP mask */
+	// This context's GFP mask
 	gfp_t gfp_mask;
 
 	unsigned long nr_lru_pages;
@@ -367,7 +385,7 @@ struct scan_control {
 		unsigned int taken;
 	} nr;
 
-	/* for recording the reclaimed slab by now */
+	// for recording the reclaimed slab by now
 	struct reclaim_state reclaim_state;
 };
 
@@ -408,7 +426,23 @@ static bool ktmm_cgroup_below_min(struct mem_cgroup *memcg)
 }
 
 
-static void scan_promotion_lists(struct lruvec *lruvec,
+static __always_inline void ktmm_update_lru_sizes(struct lruvec *lruvec,
+			enum lru_list lru, unsigned long *nr_zone_taken)
+{
+	int zid;
+
+	for (zid = 0; zid < MAX_NR_ZONES; zid++) {
+		if (!nr_zone_taken[zid])
+			continue;
+
+		ktmm_cgroup_update_lru_size(lruvec, lru, zid, -nr_zone_taken[zid]);
+	}
+
+}
+
+
+static void scan_promotion_lists(unsigned long nr_to_scan,
+				struct lruvec *lruvec,
 				struct promote_lists *pr_lists,
 				struct scan_control *sc)
 {
@@ -417,7 +451,8 @@ static void scan_promotion_lists(struct lruvec *lruvec,
 
 
 /* SIMILAR TO: shrink_active_list */
-static void scan_active_list(struct lruvec *lruvec,
+static void scan_active_list(unsigned long nr_to_scan,
+				struct lruvec *lruvec,
 				struct promote_lists *pr_lists,
 				struct scan_control *sc,
 				enum lru_list lru)
@@ -550,7 +585,8 @@ static void scan_active_list(struct lruvec *lruvec,
 
 
 /* SIMILAR TO: shrink_inactive_list() */
-static unsigned long scan_inactive_list(struct lruvec *lruvec,
+static unsigned long scan_inactive_list(unsigned long nr_to_scan,
+					struct lruvec *lruvec,
 					struct scan_control *sc,
 					enum lru_list lru)
 {
@@ -571,7 +607,7 @@ static unsigned long scan_inactive_list(struct lruvec *lruvec,
 	spin_lock_irq(&lruvec->lru_lock);
 
 	/*
-	nr_taken = isolate_lru_folios(nr_to_scan, lruvec_ext->lruvec, &folio_list,
+	nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
 				     &nr_scanned, sc, lru);
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
@@ -598,7 +634,7 @@ static unsigned long scan_inactive_list(struct lruvec *lruvec,
 	*/
 	spin_unlock_irq(&lruvec->lru_lock);
 
-	mem_cgroup_uncharge_list(&folio_list);
+	ktmm_cgroup_uncharge_list(&folio_list);
 	ktmm_free_unref_page_list(&folio_list);
 
 	return nr_migrated;
@@ -606,32 +642,16 @@ static unsigned long scan_inactive_list(struct lruvec *lruvec,
 
 
 /* SIMILAR TO: shrink_list() */
-static unsigned long scan_lru_list(enum lru_list lru, 
+static unsigned long scan_list(enum lru_list lru, 
+				unsigned long nr_to_scan,
 				struct lruvec *lruvec, 
 				struct promote_lists *pr_lists,
 				struct scan_control *sc)
 {
 	if (is_active_lru(lru))
-		scan_active_list(lruvec, pr_lists, sc, lru);
+		scan_active_list(nr_to_scan, lruvec, pr_lists, sc, lru);
 
-	return scan_inactive_list(lruvec, sc, lru);
-}
-
-
-/* similar to: shrink_lruvec() 
- * 
- * This might later consume scan_lru_list(), as it might be more simple to put
- * its code here instead.
- */
-static void scan_lruvec(struct lruvec *lruvec, 
-			struct promote_lists *pr_lists,
-			struct scan_control *sc)
-{
-	enum lru_list lru;
-
-	for_each_evictable_lru(lru) {
-		scan_lru_list(lru, lruvec, pr_lists, sc);
-	}
+	return scan_inactive_list(nr_to_scan, lruvec, sc, lru);
 }
 
 
@@ -706,42 +726,19 @@ static unsigned int scan_lru_list(struct list_head *list)
  * struct lru_list, struct lruvec [src/include/mmzone.h]
  * struct mem_cgroup, mem_cgroup_iter() [src/include/memcontrol.h]
  */
-static void scan_node(pg_data_t *pgdat)
+static void scan_node(pg_data_t *pgdat, 
+		struct scan_control *sc,
+		struct mem_cgroup_reclaim_cookie *reclaim)
 {
-	//enum lru_list lru;
+	enum lru_list lru;
 	struct mem_cgroup *memcg;
-	int memcg_count;
 	int nid = pgdat->node_id;
+	int memcg_count;
 
-	struct mem_cgroup_reclaim_cookie reclaim = {
-		.pgdat = pgdat,
-	};
+	memset(&sc->nr, 0, sizeof(sc->nr));
+	ktmm_mem_cgroup_iter(NULL, NULL, reclaim);
 
-	struct scan_control sc = {
-		//.nr_to_reclaim = SWAP_CLUSTER_MAX,
-		.nr_to_scan = 1024,
-		.nr_to_reclaim = 0,
-		.gfp_mask = TMEMD_GFP_FLAGS,
-		.priority = DEF_PRIORITY,
-		.may_writepage = !laptop_mode, //do not delay writing to disk
-		.may_unmap = 1,
-		.may_swap = 1,
-		//.reclaim_idx = MAX_NR_ZONES - 1,
-		.reclaim_idx = gfp_zone(TMEMD_GFP_FLAGS),
-		.target_mem_cgroup = NULL,
-	};
-
-	memset(&sc.nr, 0, sizeof(sc.nr));
-
-	// needs exposed to the module
-	//set_task_reclaim_state(current, &reclaim_state);
-	//task->reclaim_state = &reclaim_state;
-
-	// get the root memory cgroup
-	memcg = ktmm_mem_cgroup_iter(sc.target_mem_cgroup, NULL, &reclaim);
-	
 	pr_info("scanning lists on node %d", nid);
-
 	pr_info("Counting memory cgroups...");
 	memcg_count = 0;
 	do {
@@ -766,20 +763,24 @@ static void scan_node(pg_data_t *pgdat)
 			 * there is an unprotected supply of 
 			 * reclaimable memory from other cgroups.
 			 */
-			if (!sc.memcg_low_reclaim) {
-				sc.memcg_low_skipped = 1;
+			if (!sc->memcg_low_reclaim) {
+				sc->memcg_low_skipped = 1;
+				continue;
 			}
+			// memcg_memory_event(memcg, MEMCG_LOW);
 		}
-		// memcg_memory_event(memcg, MEMCG_LOW);
-		
 
-		reclaimed = sc.nr_reclaimed;
-		scanned = sc.nr_scanned;
+		reclaimed = sc->nr_reclaimed;
+		scanned = sc->nr_scanned;
 
-		scan_lruvec(lruvec, pr_lists, &sc);
-		scan_promotion_lists(lruvec, pr_lists, &sc);
+		for_each_evictable_lru(lru) {
+			unsigned long nr_to_scan = 1024;
 
-		pr_debug("memcg count: %d", memcg_count);
+			scan_list(lru, nr_to_scan, lruvec, pr_lists, sc);
+			scan_promotion_lists(nr_to_scan, lruvec, pr_lists, sc);
+		}
+
+		//scan_lruvec(lruvec, pr_lists, &sc);
 
 	} while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
 }
@@ -888,12 +889,39 @@ static int tmemd(void *p)
 {
 	pg_data_t *pgdat = (pg_data_t *)p;
 	int nid = pgdat->node_id;
+	struct mem_cgroup *memcg;
 	struct task_struct *task = current;
 	const struct cpumask *cpumask = cpumask_of_node(nid);
 
+	struct mem_cgroup_reclaim_cookie reclaim = {
+		.pgdat = pgdat,
+	};
+
+	struct reclaim_state reclaim_state = {
+		.reclaimed_slab = 0,
+	};
+
+	struct scan_control sc = {
+		.nr_to_reclaim = SWAP_CLUSTER_MAX,
+		//.gfp_mask = TMEMD_GFP_FLAGS,
+		.priority = DEF_PRIORITY,
+		.may_writepage = !laptop_mode, //do not delay writing to disk
+		.may_unmap = 1,
+		.may_swap = 1,
+		.reclaim_idx = MAX_NR_ZONES - 1,
+		//.reclaim_idx = gfp_zone(TMEMD_GFP_FLAGS),
+		//.target_mem_cgroup = memcg,
+	};
+
+	// get the root memory cgroup
+	memcg = ktmm_mem_cgroup_iter(NULL, NULL, &reclaim);
+	sc.target_mem_cgroup = memcg;
+	
 	// Only allow node's CPUs to run this task
 	if(!cpumask_empty(cpumask))
 		set_cpus_allowed_ptr(task, cpumask);
+
+	current->reclaim_state = &reclaim_state;
 
 	/*
 	 * Tell MM that we are a memory allocator, and that we are actually
@@ -912,14 +940,11 @@ static int tmemd(void *p)
 	 */
 	for ( ; ; )
 	{
-		scan_node(pgdat);
+		scan_node(pgdat, &sc, &reclaim);
 
-		if(kthread_should_stop()) break;
-		
-//tmemd_try_sleep:
-		//msleep(10000);
+		if (kthread_should_stop()) break;
+
 		tmemd_try_to_sleep(pgdat, nid);
-		
 	}
 
 	cleanup_node_lists(pgdat);
@@ -1008,6 +1033,8 @@ static struct ktmm_hook vmscan_hooks[] = {
 	HOOK("mem_cgroup_css_free", ktmm_mem_cgroup_css_free, &pt_mem_cgroup_css_free),
 	HOOK("free_unref_page_list", ktmm_free_unref_page_list, &pt_free_unref_page_list),
 	HOOK("lru_add_drain", ktmm_lru_add_drain, &pt_lru_add_drain),
+	HOOK("mem_cgroup_update_lru_size", ktmm_cgroup_update_lru_size, &pt_cgroup_update_lru_size),
+	HOOK("__mem_cgroup_uncharge_list", ktmm_cgroup_uncharge_list, &pt_cgroup_uncharge_list),
 };
 
 
