@@ -8,6 +8,7 @@
 
 #include <linux/atomic.h>
 #include <linux/bitops.h>
+#include <linux/buffer_head.h>
 #include <linux/cgroup.h>
 #include <linux/delay.h>
 #include <linux/freezer.h>
@@ -24,7 +25,9 @@
 #include <linux/numa.h>
 #include <linux/page-flags.h>
 #include <linux/page_ref.h>
+#include <linux/pagemap.h>
 #include <linux/printk.h>
+#include <linux/rmap.h>
 #include <linux/signal.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
@@ -46,7 +49,7 @@ int pmem_node = -1;
 static struct task_struct *tmemd_list[MAX_NUMNODES];
 
 // watermark watchdog
-static struct task_struct *wd;
+//static struct task_struct *wd;
 
 //Temporary list to hold our wait sleep queues for tmem daemons
 //Replace kswapd kswapd_wait in pglist_data?
@@ -113,6 +116,20 @@ static void (*pt_cgroup_update_lru_size)(struct lruvec *lruvec, enum lru_list lr
 static void (*pt_cgroup_uncharge_list)(struct list_head *page_list);
 
 
+// ------------------ new imports
+static unsigned long (*pt_isolate_lru_folios)(unsigned long nr_to_scan, struct lruvec *lruvec,
+					struct list_head *dst, unsigned long *nr_scanned,
+					struct scan_control *sc, enum lru_list lru);
+
+
+static unsigned int (*pt_move_folios_to_lru)(struct lruvec *lruvec, struct list_head *list);
+
+
+/*
+static void (*pt_folio_putback_lru)(struct folio *folio);
+*/
+
+
 /**************** END IMPORTED/HOOKED PROTOTYPES *****************************/
 static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
 				struct mem_cgroup *prev,
@@ -166,6 +183,29 @@ static void ktmm_cgroup_uncharge_list(struct list_head *page_list)
 {
 	pt_cgroup_uncharge_list(page_list);
 }
+
+
+// ------------------ new imports
+static unsigned long ktmm_isolate_lru_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+					struct list_head *dst, unsigned long *nr_scanned,
+					struct scan_control *sc, enum lru_list lru)
+{
+	return pt_isolate_lru_folios(nr_to_scan, lruvec, dst, nr_scanned, sc, lru);
+}
+
+
+static unsigned int ktmm_move_folios_to_lru(struct lruvec *lruvec, struct list_head *list)
+{
+	return pt_move_folios_to_lru(lruvec, list);
+}
+
+
+/*
+static void ktmm_folio_putback_lru(struct folio *folio)
+{
+	pt_folio_putback_lru(folio);
+}
+*/
 
 
 /*****************************************************************************
@@ -317,6 +357,7 @@ static int remove_promote_lists(struct lruvec *lruvec)
  * This is a import of the orignal scan_control struct from mm/vmscan.c. We 
  * will remove most of the comments for the original members for conciseness.
  */
+/*
 struct scan_control {
 	unsigned long nr_to_scan;
 	unsigned long nr_to_reclaim;
@@ -335,12 +376,12 @@ struct scan_control {
 	unsigned int may_swap:1;
 	unsigned int proactive:1;
 
-	 //* Cgroup memory below memory.low is protected as long as we
-	 //* don't threaten to OOM. If any cgroup is reclaimed at
-	 //* reduced force or passed over entirely due to its memory.low
-	 //* setting (memcg_low_skipped), and nothing is reclaimed as a
-	 //* result, then go back for one more cycle that reclaims the protected
-	 //* memory (memcg_low_reclaim) to avert OOM.
+	 // Cgroup memory below memory.low is protected as long as we
+	 // don't threaten to OOM. If any cgroup is reclaimed at
+	 // reduced force or passed over entirely due to its memory.low
+	 // setting (memcg_low_skipped), and nothing is reclaimed as a
+	 // result, then go back for one more cycle that reclaims the protected
+	 // memory (memcg_low_reclaim) to avert OOM.
 	unsigned int memcg_low_reclaim:1;
 	unsigned int memcg_low_skipped:1;
 	unsigned int hibernation_mode:1;
@@ -388,6 +429,7 @@ struct scan_control {
 	// for recording the reclaimed slab by now
 	struct reclaim_state reclaim_state;
 };
+*/
 
 
 bool watching_zonetype(struct zone *z)
@@ -441,6 +483,20 @@ static __always_inline void ktmm_update_lru_sizes(struct lruvec *lruvec,
 }
 
 
+/*
+static inline bool ktmm_folio_evictable(struct folio *folio)
+{
+	bool ret;
+
+	rcu_read_lock();
+	ret = !mapping_unevictable(folio_mapping(folio)) &&
+		!folio_test_mlocked(folio);
+	rcu_read_unlock();
+	return ret;
+}
+*/
+
+
 static void scan_promotion_lists(unsigned long nr_to_scan,
 				struct lruvec *lruvec,
 				struct promote_lists *pr_lists,
@@ -450,7 +506,17 @@ static void scan_promotion_lists(unsigned long nr_to_scan,
 }
 
 
-/* SIMILAR TO: shrink_active_list */
+/* SIMILAR TO: shrink_active_list 
+ * 
+ * NEED EXPOSED:
+ *  isolate_lru_folios
+ *  folio_evictable
+ *  folio_putback_lru
+ *  buffer_heads_over_limit
+ *  folio_needs_release
+ *  folio_referenced
+ *  move_folios_to_lru
+ */
 static void scan_active_list(unsigned long nr_to_scan,
 				struct lruvec *lruvec,
 				struct promote_lists *pr_lists,
@@ -461,8 +527,7 @@ static void scan_active_list(unsigned long nr_to_scan,
 	unsigned long nr_taken;
 	unsigned long nr_scanned;
 	unsigned long vm_flags;
-	unsigned long lock_flags;
-	LIST_HEAD(l_hold);	* The folios which were snipped off
+	LIST_HEAD(l_hold);	// The folios which were snipped off
 	LIST_HEAD(l_active);
 	LIST_HEAD(l_inactive);
 
@@ -477,22 +542,19 @@ static void scan_active_list(unsigned long nr_to_scan,
 	unsigned nr_rotated = 0;
 	int file = is_file_lru(lru);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	int nid = pgdat->node_id;
 
-	* make sure pages in per-cpu lru list are added
-	lru_add_drain();
+	// make sure pages in per-cpu lru list are added
+	ktmm_lru_add_drain();
 
-	spin_lock_irqsave(&lruvec->lru_lock, flags);
+	spin_lock_irq(&lruvec->lru_lock);
 
 	nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
 				     &nr_scanned, sc, lru);
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 
-	if (!cgroup_reclaim(sc))
-		__count_vm_events(PGREFILL, nr_scanned);
-	__count_memcg_events(lruvec_memcg(lruvec), PGREFILL, nr_scanned);
-
-	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
+	spin_unlock_irq(&lruvec->lru_lock);
 
 	while (!list_empty(&l_hold)) {
 		struct folio *folio;
@@ -515,7 +577,7 @@ static void scan_active_list(unsigned long nr_to_scan,
 		}
 
 		// MULTI-CLOCK
-		if (pgdat_ext->pm_node != 0) {
+		if (nid == pmem_node) {
 			pmem_page_sal++;
 			if (page_referenced(page, 0, sc->target_mem_cgroup, & vm_flags)) {
 				//SetPagePromote(page); NEEDS TO BE MODULE TRACKED
@@ -532,18 +594,16 @@ static void scan_active_list(unsigned long nr_to_scan,
 		}
 		// END MULTI-CLOCK
 
-		* Referenced or rmap lock contention: rotate
+		// Referenced or rmap lock contention: rotate
 		if (folio_referenced(folio, 0, sc->target_mem_cgroup,
 				     &vm_flags) != 0) {
-			 *
-			 * Identify referenced, file-backed active folios and
-			 * give them one more trip around the active list. So
-			 * that executable code get better chances to stay in
-			 * memory under moderate memory pressure.  Anon folios
-			 * are not likely to be evicted by use-once streaming
-			 * IO, plus JVM can create lots of anon VM_EXEC folios,
-			 * so we ignore them here.
-			 *
+			 // Identify referenced, file-backed active folios and
+			 // give them one more trip around the active list. So
+			 // that executable code get better chances to stay in
+			 // memory under moderate memory pressure.  Anon folios
+			 // are not likely to be evicted by use-once streaming
+			 // IO, plus JVM can create lots of anon VM_EXEC folios,
+			 // so we ignore them here.
 			if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio)) {
 				nr_rotated += folio_nr_pages(folio);
 				list_add(&folio->lru, &l_active);
@@ -551,54 +611,57 @@ static void scan_active_list(unsigned long nr_to_scan,
 			}
 		}
 
-		folio_clear_active(folio);	* we are de-activating
+		folio_clear_active(folio);	// we are de-activating
 		folio_set_workingset(folio);
 		list_add(&folio->lru, &l_inactive);
 	}
 
-	 *
-	 * Move folios back to the lru list.
-	 *
-	spin_lock_irqsave(&lruvec->lru_lock, flags);
+	//
+	// Move folios back to the lru list.
+	//
+	spin_lock_irq(&lruvec->lru_lock);
 
 	nr_activate = move_folios_to_lru(lruvec, &l_active);
 	nr_deactivate = move_folios_to_lru(lruvec, &l_inactive);
 
-	 * Keep all free folios in l_active list
+	// Keep all free folios in l_active list
 	list_splice(&l_inactive, &l_active);
-
-	__count_vm_events(PGDEACTIVATE, nr_deactivate);
-	__count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_deactivate);
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
 
-	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
+	spin_unlock_irq(&lruvec->lru_lock);
 
-	mem_cgroup_uncharge_list(&l_active);
-	free_unref_page_list(&l_active);
-	trace_mm_vmscan_lru_shrink_active(pgdat->node_id, nr_taken, nr_activate,
-			nr_deactivate, nr_rotated, sc->priority, file);
-	return;
+	ktmm_cgroup_uncharge_list(&l_active);
+	ktmm_free_unref_page_list(&l_active);
 	*/
 	return;
 }
 
 
-/* SIMILAR TO: shrink_inactive_list() */
+/* SIMILAR TO: shrink_inactive_list() 
+ *  too_many_isolated
+ *  reclaim_throttle
+ *  fatal_signal_pending
+ *  isolate_lru_folios
+ *  move_folios_to_lru
+ *  __mod_node_page_state (vmstat.h)
+ */
 static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 					struct lruvec *lruvec,
 					struct scan_control *sc,
 					enum lru_list lru)
 {
 	LIST_HEAD(folio_list);
-	//unsigned long nr_scanned;
+	unsigned long nr_scanned;
 	unsigned long nr_taken = 0;
 	unsigned long nr_migrated = 0;
 	//unsigned long nr_reclaimed = 0;
 	//isolate_mode_t isolate_mode = 0;
-	//bool file = is_file_lru(lru);
+	bool file = is_file_lru(lru);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
-	int nid = pgdat->node_id;
+	//int nid = pgdat->node_id;
+
+	pr_info("scanning inactive list");
 
 	// make sure pages in per-cpu lru list are added
 	ktmm_lru_add_drain();
@@ -606,38 +669,37 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 	// We want to isolate the pages we are going to scan.
 	spin_lock_irq(&lruvec->lru_lock);
 
-	/*
 	nr_taken = ktmm_isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
 				     &nr_scanned, sc, lru);
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
-	*/
 
 	spin_unlock_irq(&lruvec->lru_lock);
 
 	if (nr_taken == 0) return 0;
 
 	// migrate pages down to the pmem node
+	/*
 	if (pmem_node == nid) {
-		/*
 		int ret = migrate_pages(&folio_list, vmscan_alloc_pmem_page, NULL, 
 					0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG);
 		nr_migrated = (ret >= 0 ? nr_taken - ret : 0);
 		__mod_node_page_state(pgdat, NR_DEMOTED, nr_reclaimed);
-		*/
 	}
+	*/
 
 	spin_lock_irq(&lruvec->lru_lock);
-	/*
-	move_folios_to_lru(lruvec, &folio_list);
+
+	ktmm_move_folios_to_lru(lruvec, &folio_list);
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
-	*/
+
 	spin_unlock_irq(&lruvec->lru_lock);
 
 	ktmm_cgroup_uncharge_list(&folio_list);
 	ktmm_free_unref_page_list(&folio_list);
 
 	return nr_migrated;
+	//return 0;
 }
 
 
@@ -828,6 +890,7 @@ static void cleanup_node_lists(pg_data_t *pgdat)
  * This is mainly used by the watermark watchdog to wake up tmemd if levels have
  * reach below satisfactory level (below high watermark).
  */
+/*
 void wakeup_tmemd(int nid)
 {
 	//check to make sure tmemd in waiting
@@ -837,6 +900,7 @@ void wakeup_tmemd(int nid)
 	//if it is waiting, wake up
 	wake_up_interruptible(&tmemd_wait[nid]);
 }
+*/
 
 
 /**
@@ -856,21 +920,25 @@ static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
 	long remaining = 0;
 	DEFINE_WAIT(wait);
 
+	pr_info("tmemd trying to sleep: %d", nid);
+
 	if (freezing(current) || kthread_should_stop())
 		return;
 	
 	prepare_to_wait(&tmemd_wait[nid], &wait, TASK_INTERRUPTIBLE);
 	remaining = schedule_timeout(HZ);
 
+	/*
 	finish_wait(&tmemd_wait[nid], &wait);
 	prepare_to_wait(&tmemd_wait[nid], &wait, TASK_INTERRUPTIBLE);
 
-	/*
+	 *
 	 * If tmemd is interrupted, then we need to come out of sleep and go
 	 * back to scanning and migrating pages between nodes.
-	 */
+	 *
 	if (!kthread_should_stop() && !remaining) 
 		schedule();
+	*/
 
 	finish_wait(&tmemd_wait[nid], &wait);
 }
@@ -890,7 +958,7 @@ static int tmemd(void *p)
 {
 	pg_data_t *pgdat = (pg_data_t *)p;
 	int nid = pgdat->node_id;
-	struct mem_cgroup *memcg;
+	//struct mem_cgroup *memcg;
 	struct task_struct *task = current;
 	const struct cpumask *cpumask = cpumask_of_node(nid);
 
@@ -915,8 +983,8 @@ static int tmemd(void *p)
 	};
 
 	// get the root memory cgroup
-	memcg = ktmm_mem_cgroup_iter(NULL, NULL, &reclaim);
-	sc.target_mem_cgroup = memcg;
+	// memcg = ktmm_mem_cgroup_iter(NULL, NULL, &reclaim);
+	// sc.target_mem_cgroup = memcg;
 	
 	// Only allow node's CPUs to run this task
 	if(!cpumask_empty(cpumask))
@@ -982,6 +1050,7 @@ static int tmemd(void *p)
  * we may want to try and move as many pages back up to the upper tier as we
  * can.
  */
+/*
 static int wmark_watchdogd(void *p)
 {
 	struct zone *zone;
@@ -1019,6 +1088,7 @@ static int wmark_watchdogd(void *p)
 
 	return 0;
 }
+*/
 
 
 /*****************************************************************************
@@ -1036,6 +1106,8 @@ static struct ktmm_hook vmscan_hooks[] = {
 	HOOK("lru_add_drain", ktmm_lru_add_drain, &pt_lru_add_drain),
 	HOOK("mem_cgroup_update_lru_size", ktmm_cgroup_update_lru_size, &pt_cgroup_update_lru_size),
 	HOOK("__mem_cgroup_uncharge_list", ktmm_cgroup_uncharge_list, &pt_cgroup_uncharge_list),
+	HOOK("isolate_lru_folios", ktmm_isolate_lru_folios, &pt_isolate_lru_folios),
+	HOOK("move_folios_to_lru", ktmm_move_folios_to_lru, &pt_move_folios_to_lru),
 };
 
 
@@ -1074,7 +1146,7 @@ int tmemd_start_available(void)
 	}
 
 	/* start the watermark watchdog */
-	wd = kthread_run(&wmark_watchdogd, NULL, "wmark_watchdogd");
+	//wd = kthread_run(&wmark_watchdogd, NULL, "wmark_watchdogd");
 
 	return ret;
 }
@@ -1094,7 +1166,7 @@ void tmemd_stop_all(void)
 	}
 
 	/* start the watermark watchdog */
-	kthread_stop(wd);
+	//kthread_stop(wd);
 
 	uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 }
