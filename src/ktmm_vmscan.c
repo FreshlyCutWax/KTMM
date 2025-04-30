@@ -29,6 +29,7 @@
 #include <linux/page-flags.h>
 #include <linux/page_ref.h>
 #include <linux/pagemap.h>
+#include <linux/pagevec.h>
 #include <linux/printk.h>
 #include <linux/rmap.h>
 #include <linux/signal.h>
@@ -111,7 +112,6 @@ static void (*pt_cgroup_update_lru_size)(struct lruvec *lruvec, enum lru_list lr
 static void (*pt_cgroup_uncharge_list)(struct list_head *page_list);
 
 
-// ------------------ new imports
 static unsigned long (*pt_isolate_lru_folios)(unsigned long nr_to_scan, struct lruvec *lruvec,
 					struct list_head *dst, unsigned long *nr_scanned,
 					struct scan_control *sc, enum lru_list lru);
@@ -127,8 +127,18 @@ static int (*pt_folio_referenced)(struct folio *folio, int is_locked,
 				struct mem_cgroup *memcg, unsigned long *vm_flags);
 
 
+// ------------------ new imports
+/* __alloc_pages (page_alloc.c) */
 static struct page *(*pt_alloc_pages)(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 					nodemask_t *nodemask);
+
+/* __activate_page (swap.c) */
+/*
+static void (*pt_activate_folio_fn)(struct lruvec *lruvec, struct folio *folio);
+
+
+static void (*pt_lru_cache_activate_folio)(struct folio *folio);
+*/
 
 
 /**************** END IMPORTED/HOOKED PROTOTYPES *****************************/
@@ -186,7 +196,6 @@ static void ktmm_cgroup_uncharge_list(struct list_head *page_list)
 }
 
 
-// ------------------ new imports
 static unsigned long ktmm_isolate_lru_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 					struct list_head *dst, unsigned long *nr_scanned,
 					struct scan_control *sc, enum lru_list lru)
@@ -214,21 +223,59 @@ static int ktmm_folio_referenced(struct folio *folio, int is_locked,
 }
 
 /*****************************************************************************
- * NODE & LRUVEC
+ * ALLOC & SWAP
  *****************************************************************************/
 
-void set_pmem_node_id(int nid)
+/*
+static void ktmm_activate_folio_fn(struct lruvec *lruvec, struct folio *folio)
 {
-	pmem_node = nid;
+	int nid = folio_nid(folio);
+	pg_data_t *pgdat = NODE_DATA(nid);
+
+	if (folio_test_active(folio) && !folio_test_unevictable(folio) && pgdat->pm_node != 0) {
+		//long nr_pages = folio_nr_pages(folio);
+
+		lruvec_del_folio(lruvec, folio);
+		folio_clear_active(folio);
+		folio_set_promote(folio);
+		lruvec_add_folio(lruvec, folio);
+		wake_up_interruptible(&tmemd_wait[nid]);
+		//trace_mm_lru_activate(folio);
+	}
+
+	pt_activate_folio_fn(lruvec, folio);
 }
 
-/* get the next page/folio in the list */
-#define lru_to_page_next(head) (list_entry((head)->next, struct page, lru))
+
+static void ktmm_lru_cache_activate_folio(struct folio *folio)
+{
+	struct folio_batch *fbatch;
+	int nid;
+	pg_data_t *pgdat;
+	int i;
+
+	nid = folio_nid(folio);
+	pgdat = NODE_DATA(nid);
+
+	local_lock(&cpu_fbatches.lock);
+	fbatch = this_cpu_ptr(&cpu_fbatches.lru_add);
+
+	for (i = folio_batch_count(fbatch) - 1; i >= 0; i--) {
+		struct folio *batch_folio = fbatch->folios[i];
+
+		if (batch_folio == folio) {
+			if (!folio_test_active(folio))
+				folio_set_active(folio);
+			else if (pgdat->pm_node != 0)
+				folio_set_promote(folio);
+
+			break;
+		}
+	}
+}
+*/
 
 
-/*****************************************************************************
- * Node Scanning, Shrinking, and Promotion
- *****************************************************************************/
 static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 					nodemask_t *nodemask)
 {
@@ -263,6 +310,9 @@ static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int pre
 }
 
 
+/*****************************************************************************
+ * Node Scanning, Shrinking, and Promotion
+ *****************************************************************************/
 
 static bool ktmm_cgroup_below_low(struct mem_cgroup *memcg)
 {
@@ -765,6 +815,7 @@ static struct ktmm_hook vmscan_hooks[] = {
 	HOOK("folio_putback_lru", ktmm_folio_putback_lru, &pt_folio_putback_lru),
 	HOOK("folio_referenced", ktmm_folio_referenced, &pt_folio_referenced),
 	HOOK("__alloc_pages", ktmm_alloc_pages, &pt_alloc_pages),
+	//HOOK("__lru_cache_activate_folio", ktmm_lru_cache_activate_folio, &pt_lru_cache_activate_folio),
 };
 
 
