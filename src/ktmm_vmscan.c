@@ -21,6 +21,7 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/memcontrol.h>
+//#include <linux/mmflags.h>
 #include <linux/mmzone.h>
 #include <linux/mm_inline.h>
 #include <linux/nodemask.h>
@@ -126,6 +127,10 @@ static int (*pt_folio_referenced)(struct folio *folio, int is_locked,
 				struct mem_cgroup *memcg, unsigned long *vm_flags);
 
 
+static struct page *(*pt_alloc_pages)(gfp_t gfp_mask, unsigned int order, int preferred_nid,
+					nodemask_t *nodemask);
+
+
 /**************** END IMPORTED/HOOKED PROTOTYPES *****************************/
 static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
 				struct mem_cgroup *prev,
@@ -224,6 +229,39 @@ void set_pmem_node_id(int nid)
 /*****************************************************************************
  * Node Scanning, Shrinking, and Promotion
  *****************************************************************************/
+static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int preferred_nid,
+					nodemask_t *nodemask)
+{
+	//node mask of pmem_node
+	//pass node mask into alloc pages
+	nodemask_t nodemask_test;
+	int nid;
+	
+	if ((gfp_mask & __GFP_PMEM) !=0) {
+
+		for_each_node_state(nid, N_MEMORY) {
+			if(NODE_DATA(nid)->pm_node != 0)
+				node_set(nid, nodemask_test);
+			else
+				node_clear(nid, nodemask_test);
+		}
+
+		nodemask = &nodemask_test;
+	}
+	else if ((gfp_mask & __GFP_PMEM) == 0 && pmem_node_id != -1) {
+
+		for_each_node_state(nid, N_MEMORY) {
+			if (NODE_DATA(nid)->pm_node == 0)
+				node_set(nid, nodemask_test);
+			else
+				node_clear(nid, nodemask_test);
+		}
+
+		nodemask = &nodemask_test;
+	}
+	return pt_alloc_pages(gfp_mask, order, preferred_nid, nodemask);
+}
+
 
 
 static bool ktmm_cgroup_below_low(struct mem_cgroup *memcg)
@@ -726,6 +764,7 @@ static struct ktmm_hook vmscan_hooks[] = {
 	HOOK("move_folios_to_lru", ktmm_move_folios_to_lru, &pt_move_folios_to_lru),
 	HOOK("folio_putback_lru", ktmm_folio_putback_lru, &pt_folio_putback_lru),
 	HOOK("folio_referenced", ktmm_folio_referenced, &pt_folio_referenced),
+	HOOK("__alloc_pages", ktmm_alloc_pages, &pt_alloc_pages),
 };
 
 
