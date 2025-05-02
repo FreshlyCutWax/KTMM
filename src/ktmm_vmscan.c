@@ -24,6 +24,8 @@
 //#include <linux/mmflags.h>
 #include <linux/mmzone.h>
 #include <linux/mm_inline.h>
+#include <linux/migrate.h>
+#include <linux/migrate_mode.h>
 #include <linux/nodemask.h>
 #include <linux/numa.h>
 #include <linux/page-flags.h>
@@ -59,21 +61,6 @@ static struct task_struct *tmemd_list[MAX_NUMNODES];
 //Replace kswapd kswapd_wait in pglist_data?
 wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
-
-/*
-struct page* vmscan_alloc_pmem_page(struct  page *page, unsigned long data)
-{
-		gfp_t gfp_mask = GFP_USER | __GFP_PMEM;
-		//return alloc_pages_node(pmem_node_id, gfp_mask, 0);
-		return alloc_page(gfp_mask);
-}
-
-struct page* vmscan_alloc_normal_page(struct page *page, unsigned long data)
-{
-        gfp_t gfp_mask = GFP_USER;
-        return alloc_page(gfp_mask);
-}
-*/
 
 /************** IMPORTED/HOOKED PROTOTYPES HERE *****************************/
 static struct mem_cgroup *(*pt_mem_cgroup_iter)(struct mem_cgroup *root,
@@ -226,55 +213,17 @@ static int ktmm_folio_referenced(struct folio *folio, int is_locked,
  * ALLOC & SWAP
  *****************************************************************************/
 
-/*
-static void ktmm_activate_folio_fn(struct lruvec *lruvec, struct folio *folio)
+struct page* alloc_pmem_page(struct  page *page, unsigned long data)
 {
-	int nid = folio_nid(folio);
-	pg_data_t *pgdat = NODE_DATA(nid);
-
-	if (folio_test_active(folio) && !folio_test_unevictable(folio) && pgdat->pm_node != 0) {
-		//long nr_pages = folio_nr_pages(folio);
-
-		lruvec_del_folio(lruvec, folio);
-		folio_clear_active(folio);
-		folio_set_promote(folio);
-		lruvec_add_folio(lruvec, folio);
-		wake_up_interruptible(&tmemd_wait[nid]);
-		//trace_mm_lru_activate(folio);
-	}
-
-	pt_activate_folio_fn(lruvec, folio);
+		gfp_t gfp_mask = GFP_USER | __GFP_PMEM;
+		return alloc_page(gfp_mask);
 }
 
-
-static void ktmm_lru_cache_activate_folio(struct folio *folio)
+struct page* alloc_normal_page(struct page *page, unsigned long data)
 {
-	struct folio_batch *fbatch;
-	int nid;
-	pg_data_t *pgdat;
-	int i;
-
-	nid = folio_nid(folio);
-	pgdat = NODE_DATA(nid);
-
-	local_lock(&cpu_fbatches.lock);
-	fbatch = this_cpu_ptr(&cpu_fbatches.lru_add);
-
-	for (i = folio_batch_count(fbatch) - 1; i >= 0; i--) {
-		struct folio *batch_folio = fbatch->folios[i];
-
-		if (batch_folio == folio) {
-			if (!folio_test_active(folio))
-				folio_set_active(folio);
-			else if (pgdat->pm_node != 0)
-				folio_set_promote(folio);
-
-			break;
-		}
-	}
+        gfp_t gfp_mask = GFP_USER;
+        return alloc_page(gfp_mask);
 }
-*/
-
 
 static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 					nodemask_t *nodemask)
@@ -370,7 +319,7 @@ static void scan_promote_list(unsigned long nr_to_scan,
 {
 	unsigned long nr_taken;
 	unsigned long nr_scanned;
-	//unsigned long nr_migrated = 0;
+	unsigned long nr_migrated = 0;
 	isolate_mode_t isolate_mode = 0;
 	LIST_HEAD(l_hold);
 	int file = is_file_lru(lru);
@@ -391,14 +340,13 @@ static void scan_promote_list(unsigned long nr_to_scan,
 
 	spin_unlock_irq(&lruvec->lru_lock);
 
-	/*
 	if (nr_taken) {
-		int ret = migrate_pages(&l_hold, vmscan_alloc_normal_page,
-				NULL, 0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG);
+		unsigned int succeeded;
+		int ret = migrate_pages(&l_hold, alloc_normal_page,
+				NULL, 0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG, &succeeded);
 		nr_migrated = (ret < 0 ? 0 : nr_taken - ret);
 		__mod_node_page_state(pgdat, NR_PROMOTED, nr_migrated);
 	}
-	*/
 
 	spin_lock_irq(&lruvec->lru_lock);
 
@@ -466,22 +414,23 @@ static void scan_active_list(unsigned long nr_to_scan,
 		}
 
 		// node migration
-		/*
-		if (nid == pmem_node) {
+		if (pgdat->pm_node != 0) {
 			if (folio_referenced(folio, 0, sc->target_mem_cgroup, &vm_flags)) {
 				//SetPagePromote(page); NEEDS TO BE MODULE TRACKED
-				list_add(&page->lru, &l_promote);
+				folio_set_promote(folio);
+				list_add(&folio->lru, &l_promote);
 				continue;
 			}
 		}
 
 		// might not need, we only care about promoting here in the
 		// module
+		/*
 		if (sc->only_promote) {
 			list_add(&page->lru, &l_active);
+			continue;
 		}
 		*/
-		// END MULTI-CLOCK
 
 		// Referenced or rmap lock contention: rotate
 		if (ktmm_folio_referenced(folio, 0, sc->target_mem_cgroup,
@@ -533,7 +482,7 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 	unsigned long nr_scanned;
 	unsigned long nr_taken = 0;
 	unsigned long nr_migrated = 0;
-	//unsigned long nr_reclaimed = 0;
+	unsigned long nr_reclaimed = 0;
 	//isolate_mode_t isolate_mode = 0;
 	bool file = is_file_lru(lru);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
@@ -557,14 +506,13 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 	if (nr_taken == 0) return 0;
 
 	// migrate pages down to the pmem node
-	/*
-	if (pmem_node == nid) {
-		int ret = migrate_pages(&folio_list, vmscan_alloc_pmem_page, NULL, 
-					0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG);
+	if (pgdat->pm_node == 0) {
+		unsigned int succeeded;
+		int ret = migrate_pages(&folio_list, alloc_pmem_page, NULL, 
+					0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG, &succeeded);
 		nr_migrated = (ret >= 0 ? nr_taken - ret : 0);
 		__mod_node_page_state(pgdat, NR_DEMOTED, nr_reclaimed);
 	}
-	*/
 
 	spin_lock_irq(&lruvec->lru_lock);
 
