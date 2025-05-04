@@ -50,40 +50,30 @@
 // which node is the pmem node
 int pmem_node = -1;
 
-// Temporary list to hold references to tmem daemons.
-// Replace kswapd task_struct in pglist_data?
+/* holds pointers to the tmemd daemons running per node */
 static struct task_struct *tmemd_list[MAX_NUMNODES];
 
-// watermark watchdog
-//static struct task_struct *wd;
 
-//Temporary list to hold our wait sleep queues for tmem daemons
-//Replace kswapd kswapd_wait in pglist_data?
+/* per node tmemd wait queues */
 wait_queue_head_t tmemd_wait[MAX_NUMNODES];
 
 
-/************** IMPORTED/HOOKED PROTOTYPES HERE *****************************/
+/************** MISC HOOKED FUNCTION PROTOTYPES *****************************/
 static struct mem_cgroup *(*pt_mem_cgroup_iter)(struct mem_cgroup *root,
 				struct mem_cgroup *prev,
 				struct mem_cgroup_reclaim_cookie *reclaim);
 
 
-/* FROM: page_alloc.c */
 static bool (*pt_zone_watermark_ok_safe)(struct zone *z,
 					unsigned int order,
 					unsigned long mark,
 					int highest_zoneidx);
 
 
-/* FROM: mmzone.c */
 static struct pglist_data *(*pt_first_online_pgdat)(void);
 
 
-/* FROM: mmzone.c */
 static struct zone *(*pt_next_zone)(struct zone *zone);
-
-
-//static void (*pt_mem_cgroup_css_free)(struct cgroup_subsys_state *css);
 
 
 static void (*pt_free_unref_page_list)(struct list_head *list);
@@ -114,21 +104,13 @@ static int (*pt_folio_referenced)(struct folio *folio, int is_locked,
 				struct mem_cgroup *memcg, unsigned long *vm_flags);
 
 
-// ------------------ new imports
 /* __alloc_pages (page_alloc.c) */
+/* probably needs removed */
 static struct page *(*pt_alloc_pages)(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 					nodemask_t *nodemask);
 
-/* __activate_page (swap.c) */
-/*
-static void (*pt_activate_folio_fn)(struct lruvec *lruvec, struct folio *folio);
 
-
-static void (*pt_lru_cache_activate_folio)(struct folio *folio);
-*/
-
-
-/**************** END IMPORTED/HOOKED PROTOTYPES *****************************/
+/**************** KTMM IMPLEMENTATION OF HOOKED FUNCTION **********************/
 static struct mem_cgroup *ktmm_mem_cgroup_iter(struct mem_cgroup *root,
 				struct mem_cgroup *prev,
 				struct mem_cgroup_reclaim_cookie *reclaim)
@@ -213,18 +195,36 @@ static int ktmm_folio_referenced(struct folio *folio, int is_locked,
  * ALLOC & SWAP
  *****************************************************************************/
 
+/**
+ * alloc_pmem_page - allocate a page on pmem node
+ *
+ * @page:	single page
+ * @data:	misc data
+ *
+ * This is to be fed into migrate_pages() as a parameter.
+ */
 struct page* alloc_pmem_page(struct  page *page, unsigned long data)
 {
 		gfp_t gfp_mask = GFP_USER | __GFP_PMEM;
 		return alloc_page(gfp_mask);
 }
 
+
+/**
+ * alloc_normal_page - allocate a page on a normal node
+ *
+ * @page:	single page
+ * @data:	misc data
+ *
+ * This is to be fed into migrate_pages() as a parameter.
+ */
 struct page* alloc_normal_page(struct page *page, unsigned long data)
 {
         gfp_t gfp_mask = GFP_USER;
         return alloc_page(gfp_mask);
 }
 
+/* probably needs removed */
 static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 					nodemask_t *nodemask)
 {
@@ -263,6 +263,13 @@ static struct page *ktmm_alloc_pages(gfp_t gfp_mask, unsigned int order, int pre
  * Node Scanning, Shrinking, and Promotion
  *****************************************************************************/
 
+/**
+ * ktmm_cgroup_below_low - if memory cgroup is below low memory thresh
+ *
+ * @memcg:	memory cgroup
+ *
+ * This is a reimplementation from the kernel function.
+ */
 static bool ktmm_cgroup_below_low(struct mem_cgroup *memcg)
 {
 	return READ_ONCE(memcg->memory.elow) >=
@@ -270,6 +277,13 @@ static bool ktmm_cgroup_below_low(struct mem_cgroup *memcg)
 }
 
 
+/**
+ * ktmm_cgroup_below_min - if memory cgroup is below min memory thresh
+ *
+ * @memcg:	memory cgroup
+ *
+ * This is a reimplementation from the kernel function.
+ */
 static bool ktmm_cgroup_below_min(struct mem_cgroup *memcg)
 {
 	return READ_ONCE(memcg->memory.emin) >=
@@ -277,6 +291,15 @@ static bool ktmm_cgroup_below_min(struct mem_cgroup *memcg)
 }
 
 
+/**
+ * ktmm_update_lru_sizes - updates the size of the lru list
+ *
+ * @lruvec:		per memcg lruvec
+ * @lru:		the lru list
+ * @nr_zone_taken:	the number of folios taken from the lru list
+ *
+ * This is a reimplementation from the kernel function.
+ */
 static __always_inline void ktmm_update_lru_sizes(struct lruvec *lruvec,
 			enum lru_list lru, unsigned long *nr_zone_taken)
 {
@@ -292,6 +315,13 @@ static __always_inline void ktmm_update_lru_sizes(struct lruvec *lruvec,
 }
 
 
+/**
+ * ktmm_folio_evictable - if the folio is evictable or not
+ *
+ * @folio:	folio to test
+ *
+ * This is a reimplementation from the kernel function.
+ */
 static inline bool ktmm_folio_evictable(struct folio *folio)
 {
 	bool ret;
@@ -304,6 +334,13 @@ static inline bool ktmm_folio_evictable(struct folio *folio)
 }
 
 
+/**
+ * ktmm_folio_needs_release - if the folio needs release before free
+ *
+ * @folio:	folio to test
+ *
+ * This is a reimplementation from the kernel function.
+ */
 static inline bool ktmm_folio_needs_release(struct folio *folio)
 {
 	struct address_space *mapping = folio_mapping(folio);
@@ -312,10 +349,23 @@ static inline bool ktmm_folio_needs_release(struct folio *folio)
 }
 
 
+/**
+ * scan_promote_list - scan promote lru folios for migration
+ *
+ * @nr_to_scan:		number to scan
+ * @lruvec:		target lruvec
+ * @sc:			scan control
+ * @lru:		lru list to scan
+ *
+ * Scans the promote lru list for candidates to either migrate or bump down back
+ * to the active lru list. This function should only really be utilized by the
+ * pmem node.
+ */
 static void scan_promote_list(unsigned long nr_to_scan,
 				struct lruvec *lruvec,
 				struct scan_control *sc,
-				enum lru_list lru)
+				enum lru_list lru,
+				struct pglist_data *pgdat)
 {
 	unsigned long nr_taken;
 	unsigned long nr_scanned;
@@ -323,9 +373,9 @@ static void scan_promote_list(unsigned long nr_to_scan,
 	isolate_mode_t isolate_mode = 0;
 	LIST_HEAD(l_hold);
 	int file = is_file_lru(lru);
-	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	//struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
-	pr_info("scanning promote list");
+	//pr_info("scanning promote list");
 
 	if (!sc->may_unmap)
 		isolate_mode |= ISOLATE_UNMAPPED;
@@ -345,6 +395,7 @@ static void scan_promote_list(unsigned long nr_to_scan,
 		int ret = migrate_pages(&l_hold, alloc_normal_page,
 				NULL, 0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG, &succeeded);
 		nr_migrated = (ret < 0 ? 0 : nr_taken - ret);
+		pr_info("migrated promote");
 		__mod_node_page_state(pgdat, NR_PROMOTED, nr_migrated);
 	}
 
@@ -360,11 +411,24 @@ static void scan_promote_list(unsigned long nr_to_scan,
 }
 
 
-/* SIMILAR TO: shrink_active_list */
+/**
+ * scan_active_list - scan lru folios from the active list
+ *
+ * @nr_to_scan:		number to scan
+ * @lruvec:		target lruvec
+ * @sc:			scan control
+ * @lru:		lru list to scan
+ *
+ * This is a reimplementation of shrink_active_list from vmscan.c. Here, we scan
+ * the active list and move folios either down to the inactive list or up to the
+ * promote list. Folios will only be moved to the promote list if we are
+ * scanning on the pmem node.
+ */
 static void scan_active_list(unsigned long nr_to_scan,
 				struct lruvec *lruvec,
 				struct scan_control *sc,
-				enum lru_list lru)
+				enum lru_list lru,
+				struct pglist_data *pgdat)
 {
 	unsigned long nr_taken;
 	unsigned long nr_scanned;
@@ -376,10 +440,10 @@ static void scan_active_list(unsigned long nr_to_scan,
 	unsigned nr_deactivate, nr_activate;
 	unsigned nr_rotated = 0;
 	int file = is_file_lru(lru);
-	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	//struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	//int nid = pgdat->node_id;
 	
-	pr_info("scanning active list");
+	//pr_info("scanning active list");
 
 	// make sure pages in per-cpu lru list are added
 	ktmm_lru_add_drain();
@@ -425,12 +489,10 @@ static void scan_active_list(unsigned long nr_to_scan,
 
 		// might not need, we only care about promoting here in the
 		// module
-		/*
 		if (sc->only_promote) {
-			list_add(&page->lru, &l_active);
+			list_add(&folio->lru, &l_active);
 			continue;
 		}
-		*/
 
 		// Referenced or rmap lock contention: rotate
 		if (ktmm_folio_referenced(folio, 0, sc->target_mem_cgroup,
@@ -472,11 +534,26 @@ static void scan_active_list(unsigned long nr_to_scan,
 }
 
 
-/* SIMILAR TO: shrink_inactive_list() */
+/**
+ * scan_inactive_list - scan inactive lru list folios
+ *
+ * @nr_to_scan:		number to scan
+ * @lruvec:		target lruvec
+ * @sc:			scan control
+ * @lru:		lru list to scan
+ *
+ * This is a reimplementation of shrink_inactive_list from vmscan.c. Here, we
+ * scan folios and move them down to the pmem node if they have not been
+ * referenced. If they are already on the pmem node, we only consider moving
+ * them up the to active list if they have been referenced. We do not do any
+ * reclaiming here, and let direct reclaim or kswapd take care of reclaiming
+ * folios when neccessary.
+ */
 static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 					struct lruvec *lruvec,
 					struct scan_control *sc,
-					enum lru_list lru)
+					enum lru_list lru,
+					struct pglist_data *pgdat)
 {
 	LIST_HEAD(folio_list);
 	unsigned long nr_scanned;
@@ -485,10 +562,10 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 	unsigned long nr_reclaimed = 0;
 	//isolate_mode_t isolate_mode = 0;
 	bool file = is_file_lru(lru);
-	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	//struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	//int nid = pgdat->node_id;
 
-	pr_info("scanning inactive list");
+	//pr_info("scanning inactive list");
 
 	// make sure pages in per-cpu lru list are added
 	ktmm_lru_add_drain();
@@ -503,14 +580,17 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 
 	spin_unlock_irq(&lruvec->lru_lock);
 
+	//pr_info("isolated on inactive");
+
 	if (nr_taken == 0) return 0;
 
 	// migrate pages down to the pmem node
-	if (pgdat->pm_node == 0) {
+	if (pgdat->pm_node == 0 && pmem_node_id != -1) {
 		unsigned int succeeded;
 		int ret = migrate_pages(&folio_list, alloc_pmem_page, NULL, 
 					0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG, &succeeded);
 		nr_migrated = (ret >= 0 ? nr_taken - ret : 0);
+		pr_info("migrated inactive");
 		__mod_node_page_state(pgdat, NR_DEMOTED, nr_reclaimed);
 	}
 
@@ -521,6 +601,8 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 
 	spin_unlock_irq(&lruvec->lru_lock);
 
+	//pr_info("moved folios inactive");
+
 	ktmm_cgroup_uncharge_list(&folio_list);
 	ktmm_free_unref_page_list(&folio_list);
 
@@ -530,18 +612,27 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 
 
 /* SIMILAR TO: shrink_list() */
+/**
+ * scan_list - determines which scan function to call per list
+ *
+ * @lru:		lru list to scan
+ * @nr_to_scan:		number to scan
+ * @lruvec:		target lruvec
+ * @sc:			scan control
+ */
 static unsigned long scan_list(enum lru_list lru, 
 				unsigned long nr_to_scan,
 				struct lruvec *lruvec, 
-				struct scan_control *sc)
+				struct scan_control *sc,
+				struct pglist_data *pgdat)
 {
 	if (is_active_lru(lru))
-		scan_active_list(nr_to_scan, lruvec, sc, lru);
+		scan_active_list(nr_to_scan, lruvec, sc, lru, pgdat);
 
 	if(is_promote_lru(lru))
-		scan_promote_list(nr_to_scan, lruvec, sc, lru);
+		scan_promote_list(nr_to_scan, lruvec, sc, lru, pgdat);
 
-	return scan_inactive_list(nr_to_scan, lruvec, sc, lru);
+	return scan_inactive_list(nr_to_scan, lruvec, sc, lru, pgdat);
 }
 
 
@@ -551,27 +642,7 @@ static unsigned long scan_list(enum lru_list lru,
  * @pgdat:	node data struct
  * @nid:	node ID number
  *
- * This is responsible for scanning a node's list by invoking
- * the scan_lru_list function. The memory control group is 
- * first acquired to gain access to lruvec. This is done by
- * using our casted version of mem_cgroup_iter that is defined
- * in tmem_syms.h. 
- *
- * The memcg struct is a mem_cgroup structure. It contains a
- * pointer to the node's lruvec, which is why we need it to
- * gain access to the lruvec. The member __lruvec in pglist_data
- * is not active, and cannot no longer be used to get the LRU
- * lists.
- *
- * After acquiring the lruvec, we use for_each_evicatable_lru()
- * to iterate over all LRU lists in the node; calling scan_lru_list
- * on each list. Notice, we acquire the lru_lock first before
- * scanning a list to avoid race conditions. 
- *
- * This is partially modeled from scan_node() in multi-clock.
- *
- * struct lru_list, struct lruvec [src/include/mmzone.h]
- * struct mem_cgroup, mem_cgroup_iter() [src/include/memcontrol.h]
+ * This is responsible for scanning the lruvec per memory cgroup.
  */
 static void scan_node(pg_data_t *pgdat, 
 		struct scan_control *sc,
@@ -586,8 +657,7 @@ static void scan_node(pg_data_t *pgdat,
 	memcg = ktmm_mem_cgroup_iter(NULL, NULL, reclaim);
 	sc->target_mem_cgroup = memcg;
 
-	pr_info("scanning lists on node %d", nid);
-	//pr_info("Counting memory cgroups...");
+	//pr_info("scanning lists on node %d", nid);
 	memcg_count = 0;
 	do {
 		struct lruvec *lruvec = &memcg->nodeinfo[nid]->lruvec;
@@ -624,7 +694,7 @@ static void scan_node(pg_data_t *pgdat,
 		for_each_evictable_lru(lru) {
 			unsigned long nr_to_scan = 1024;
 
-			scan_list(lru, nr_to_scan, lruvec, sc);
+			scan_list(lru, nr_to_scan, lruvec, sc, pgdat);
 		}
 	} while ((memcg = ktmm_mem_cgroup_iter(NULL, memcg, NULL)));
 }
@@ -651,7 +721,7 @@ static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
 	long remaining = 0;
 	DEFINE_WAIT(wait);
 
-	pr_info("tmemd trying to sleep: %d", nid);
+	//pr_info("tmemd trying to sleep: %d", nid);
 
 	if (freezing(current) || kthread_should_stop())
 		return;
@@ -697,6 +767,7 @@ static int tmemd(void *p)
 		.may_unmap = 1,
 		.may_swap = 1,
 		.reclaim_idx = MAX_NR_ZONES - 1,
+		.only_promote = 1,
 		//.reclaim_idx = gfp_zone(TMEMD_GFP_FLAGS),
 		//.target_mem_cgroup = memcg,
 	};
@@ -720,7 +791,7 @@ static int tmemd(void *p)
 	task->flags |= PF_MEMALLOC | PF_KSWAPD;
 
 
-	pr_debug("tmemd started on node %d", nid);
+	//pr_info("tmemd started on node %d", nid);
 
 	/*
 	 * Loop every few seconds and scan the node's LRU lists.
@@ -795,6 +866,13 @@ int tmemd_start_available(void)
 	for_each_online_node(nid)
 	{
 		pg_data_t *pgdat = NODE_DATA(nid);
+
+		/* !! EMULATE PMEM NODE !! */
+		if (nid == 1) {
+			pr_info("Emulating pmem node");
+			set_pmem_node_id(nid);
+			set_pmem_node(nid);
+		}
 
         	tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
 	}
