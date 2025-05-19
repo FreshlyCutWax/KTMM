@@ -105,7 +105,6 @@ static int (*pt_folio_referenced)(struct folio *folio, int is_locked,
 
 
 /* __alloc_pages (page_alloc.c) */
-/* probably needs removed */
 static struct page *(*pt_alloc_pages)(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 					nodemask_t *nodemask);
 
@@ -356,6 +355,7 @@ static inline bool ktmm_folio_needs_release(struct folio *folio)
  * @lruvec:		target lruvec
  * @sc:			scan control
  * @lru:		lru list to scan
+ * @pgdat:		node data
  *
  * Scans the promote lru list for candidates to either migrate or bump down back
  * to the active lru list. This function should only really be utilized by the
@@ -373,9 +373,14 @@ static void scan_promote_list(unsigned long nr_to_scan,
 	isolate_mode_t isolate_mode = 0;
 	LIST_HEAD(l_hold);
 	int file = is_file_lru(lru);
-	//struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	int nid = pgdat->node_id;
 
-	//pr_info("scanning promote list");
+	struct list_head *src = &lruvec->lists[lru];
+
+	if (list_empty(src))
+		pr_debug("promote list empty");
+
+	//pr_debug("scanning promote list");
 
 	if (!sc->may_unmap)
 		isolate_mode |= ISOLATE_UNMAPPED;
@@ -390,13 +395,17 @@ static void scan_promote_list(unsigned long nr_to_scan,
 
 	spin_unlock_irq(&lruvec->lru_lock);
 
+	pr_debug("pgdat %d scanned %lu on promote list", nid, nr_scanned);
+	pr_debug("pgdat %d taken %lu on promote list", nid, nr_taken);
+
 	if (nr_taken) {
 		unsigned int succeeded;
 		int ret = migrate_pages(&l_hold, alloc_normal_page,
 				NULL, 0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG, &succeeded);
 		nr_migrated = (ret < 0 ? 0 : nr_taken - ret);
-		pr_info("migrated promote");
 		__mod_node_page_state(pgdat, NR_PROMOTED, nr_migrated);
+
+		pr_debug("pgdat %d migrated %lu folios from promote list", nid, nr_migrated);
 	}
 
 	spin_lock_irq(&lruvec->lru_lock);
@@ -418,6 +427,7 @@ static void scan_promote_list(unsigned long nr_to_scan,
  * @lruvec:		target lruvec
  * @sc:			scan control
  * @lru:		lru list to scan
+ * @pgdat:		node data
  *
  * This is a reimplementation of shrink_active_list from vmscan.c. Here, we scan
  * the active list and move folios either down to the inactive list or up to the
@@ -437,11 +447,10 @@ static void scan_active_list(unsigned long nr_to_scan,
 	LIST_HEAD(l_active);
 	LIST_HEAD(l_inactive);
 	LIST_HEAD(l_promote);
-	unsigned nr_deactivate, nr_activate;
+	unsigned nr_deactivate, nr_activate, nr_promote;
 	unsigned nr_rotated = 0;
 	int file = is_file_lru(lru);
-	//struct pglist_data *pgdat = lruvec_pgdat(lruvec);
-	//int nid = pgdat->node_id;
+	int nid = pgdat->node_id;
 	
 	//pr_info("scanning active list");
 
@@ -479,7 +488,9 @@ static void scan_active_list(unsigned long nr_to_scan,
 
 		// node migration
 		if (pgdat->pm_node != 0) {
+			//pr_debug("active pm_node");
 			if (ktmm_folio_referenced(folio, 0, sc->target_mem_cgroup, &vm_flags)) {
+				pr_debug("set promote");
 				//SetPagePromote(page); NEEDS TO BE MODULE TRACKED
 				folio_set_promote(folio);
 				list_add(&folio->lru, &l_promote);
@@ -489,21 +500,25 @@ static void scan_active_list(unsigned long nr_to_scan,
 
 		// might not need, we only care about promoting here in the
 		// module
+		/*
 		if (sc->only_promote) {
 			list_add(&folio->lru, &l_active);
 			continue;
 		}
+		*/
 
 		// Referenced or rmap lock contention: rotate
 		if (ktmm_folio_referenced(folio, 0, sc->target_mem_cgroup,
 				     &vm_flags) != 0) {
-			 // Identify referenced, file-backed active folios and
-			 // give them one more trip around the active list. So
-			 // that executable code get better chances to stay in
-			 // memory under moderate memory pressure.  Anon folios
-			 // are not likely to be evicted by use-once streaming
-			 // IO, plus JVM can create lots of anon VM_EXEC folios,
-			 // so we ignore them here.
+			/*
+			  Identify referenced, file-backed active folios and
+			  give them one more trip around the active list. So
+			  that executable code get better chances to stay in
+			  memory under moderate memory pressure.  Anon folios
+			  are not likely to be evicted by use-once streaming
+			  IO, plus JVM can create lots of anon VM_EXEC folios,
+			  so we ignore them here.
+			*/
 			if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio)) {
 				nr_rotated += folio_nr_pages(folio);
 				list_add(&folio->lru, &l_active);
@@ -521,6 +536,11 @@ static void scan_active_list(unsigned long nr_to_scan,
 
 	nr_activate = ktmm_move_folios_to_lru(lruvec, &l_active);
 	nr_deactivate = ktmm_move_folios_to_lru(lruvec, &l_inactive);
+	nr_promote = ktmm_move_folios_to_lru(lruvec, &l_promote);
+
+	pr_debug("pgdat %d folio activated: %d", nid, nr_activate);
+	pr_debug("pgdat %d folio deactivated: %d", nid, nr_deactivate);
+	pr_debug("pgdat %d folio promoted: %d", nid, nr_promote);
 
 	// Keep all free folios in l_active list
 	list_splice(&l_inactive, &l_active);
@@ -541,6 +561,7 @@ static void scan_active_list(unsigned long nr_to_scan,
  * @lruvec:		target lruvec
  * @sc:			scan control
  * @lru:		lru list to scan
+ * @pgdat:		node data
  *
  * This is a reimplementation of shrink_inactive_list from vmscan.c. Here, we
  * scan folios and move them down to the pmem node if they have not been
@@ -560,11 +581,8 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 	unsigned long nr_taken = 0;
 	unsigned long nr_migrated = 0;
 	unsigned long nr_reclaimed = 0;
-	//isolate_mode_t isolate_mode = 0;
 	bool file = is_file_lru(lru);
-	//struct pglist_data *pgdat = lruvec_pgdat(lruvec);
-	//int nid = pgdat->node_id;
-
+	int nid = pgdat->node_id;
 	//pr_info("scanning inactive list");
 
 	// make sure pages in per-cpu lru list are added
@@ -580,8 +598,6 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 
 	spin_unlock_irq(&lruvec->lru_lock);
 
-	//pr_info("isolated on inactive");
-
 	if (nr_taken == 0) return 0;
 
 	// migrate pages down to the pmem node
@@ -590,7 +606,7 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 		int ret = migrate_pages(&folio_list, alloc_pmem_page, NULL, 
 					0, MIGRATE_SYNC, MR_MEMORY_HOTPLUG, &succeeded);
 		nr_migrated = (ret >= 0 ? nr_taken - ret : 0);
-		pr_info("migrated inactive");
+		pr_debug("pgdat %d migrated %lu folios from inactive list", nid, nr_migrated);
 		__mod_node_page_state(pgdat, NR_DEMOTED, nr_reclaimed);
 	}
 
@@ -601,13 +617,10 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
 
 	spin_unlock_irq(&lruvec->lru_lock);
 
-	//pr_info("moved folios inactive");
-
 	ktmm_cgroup_uncharge_list(&folio_list);
 	ktmm_free_unref_page_list(&folio_list);
 
 	return nr_migrated;
-	//return 0;
 }
 
 
@@ -619,6 +632,7 @@ static unsigned long scan_inactive_list(unsigned long nr_to_scan,
  * @nr_to_scan:		number to scan
  * @lruvec:		target lruvec
  * @sc:			scan control
+ * @pgdat:		node data
  */
 static unsigned long scan_list(enum lru_list lru, 
 				unsigned long nr_to_scan,
@@ -641,6 +655,7 @@ static unsigned long scan_list(enum lru_list lru,
  * 
  * @pgdat:	node data struct
  * @nid:	node ID number
+ * @reclaim:	memory reclaim cookie
  *
  * This is responsible for scanning the lruvec per memory cgroup.
  */
@@ -661,12 +676,10 @@ static void scan_node(pg_data_t *pgdat,
 	memcg_count = 0;
 	do {
 		struct lruvec *lruvec = &memcg->nodeinfo[nid]->lruvec;
-		//struct promote_lists *pr_lists = lruvec_promote_lists(lruvec);
 		unsigned long reclaimed;
 		unsigned long scanned;
 
 		memcg_count += 1;
-		//pr_info("Count: %d", memcg_count);
 
 		if (ktmm_cgroup_below_min(memcg)) {
 			/*
@@ -705,16 +718,13 @@ static void scan_node(pg_data_t *pgdat,
  *****************************************************************************/
 
 /**
- * tmemd_try_to_sleep - put tmemd to sleep if not needed
+ * tmemd_try_to_sleep - put tmemd to sleep for a short time
  *
- * @pgdat:	pglist_data node structure
+ * @pgdat:	node data
  * @nid:	node id
  *
  * @returns:	none
  *
- * A helper function for tmemd to check if it can sleep when there is no need
- * for it to scan pages. We only want to it to try and migrate pages between
- * nodes only if memory pressure is great enough to do so.
  */
 static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
 {
@@ -738,16 +748,12 @@ static void tmemd_try_to_sleep(pg_data_t *pgdat, int nid)
  *
  * @p:	pointer to node data struct (pglist_data)
  *
- * This function will replace the task_struct kswapd* 
- * that is found in the pglist_data pgdat struct.
- * Currently, we only store it in our own local array
- * of type task_struct.
+ * This is stored in a local array for module access only.
  */
 static int tmemd(void *p) 
 {
 	pg_data_t *pgdat = (pg_data_t *)p;
 	int nid = pgdat->node_id;
-	//struct mem_cgroup *memcg;
 	struct task_struct *task = current;
 	const struct cpumask *cpumask = cpumask_of_node(nid);
 
@@ -768,14 +774,8 @@ static int tmemd(void *p)
 		.may_swap = 1,
 		.reclaim_idx = MAX_NR_ZONES - 1,
 		.only_promote = 1,
-		//.reclaim_idx = gfp_zone(TMEMD_GFP_FLAGS),
-		//.target_mem_cgroup = memcg,
 	};
 
-	// get the root memory cgroup
-	// memcg = ktmm_mem_cgroup_iter(NULL, NULL, &reclaim);
-	// sc.target_mem_cgroup = memcg;
-	
 	// Only allow node's CPUs to run this task
 	if(!cpumask_empty(cpumask))
 		set_cpus_allowed_ptr(task, cpumask);
@@ -806,8 +806,6 @@ static int tmemd(void *p)
 		tmemd_try_to_sleep(pgdat, nid);
 	}
 
-	//cleanup_node_lists(pgdat);
-
 	task->flags &= ~(PF_MEMALLOC | PF_KSWAPD);
 	current->reclaim_state = NULL;
 	
@@ -834,28 +832,25 @@ static struct ktmm_hook vmscan_hooks[] = {
 	HOOK("folio_putback_lru", ktmm_folio_putback_lru, &pt_folio_putback_lru),
 	HOOK("folio_referenced", ktmm_folio_referenced, &pt_folio_referenced),
 	HOOK("__alloc_pages", ktmm_alloc_pages, &pt_alloc_pages),
-	//HOOK("__lru_cache_activate_folio", ktmm_lru_cache_activate_folio, &pt_lru_cache_activate_folio),
 };
 
 
 /**
  * Daemons are only started on online/active nodes. They are
- * currently stored in a local list, but will later need to be
- * stored with the node itself (in-place of kswapd in pglist_data).
+ * currently stored in a local array.
  *
  * We will also need to define the behavior for hot-plugging nodes
  * into the system, as this code only sets up daemons on nodes 
  * that are online the moment the module starts.
  *
- * for_each_online_node() & NODE_DATA() [src/include/mmzone.h]
- *
- * kthread_run [src/include/kthread.h]
  */
 int tmemd_start_available(void) 
 {
 	int i;
 	int nid;
 	int ret;
+
+	set_ktmm_scan();
 
 	/* initialize wait queues for sleeping */
 	for (i = 0; i < MAX_NUMNODES; i++)
@@ -876,9 +871,6 @@ int tmemd_start_available(void)
 
         	tmemd_list[nid] = kthread_run(&tmemd, pgdat, "tmemd");
 	}
-
-	/* start the watermark watchdog */
-	//wd = kthread_run(&wmark_watchdogd, NULL, "wmark_watchdogd");
 
 	return ret;
 }
