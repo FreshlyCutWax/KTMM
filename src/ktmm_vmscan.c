@@ -888,7 +888,7 @@ void tmemd_stop_all(void)
 	{
 		kthread_stop(tmemd_list[nid]);
 	}
-
+  
 	uninstall_hooks(vmscan_hooks, ARRAY_SIZE(vmscan_hooks));
 }
 
