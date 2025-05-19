@@ -2,7 +2,7 @@
 
 import time
 
-limit = 5           # in gigabytes
+limit = 15           # in gigabytes
 size_x = 4          # number of kilobytes
 to_alloc = 1024     # number of blocks to alloc per iteration
 

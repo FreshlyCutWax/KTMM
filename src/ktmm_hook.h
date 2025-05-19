@@ -76,4 +76,6 @@ void uninstall_hooks(struct ktmm_hook *hooks, size_t count);
 int install_hooks(struct ktmm_hook *hooks, size_t count);
 
 
+unsigned long symbol_lookup(const char *symbol_name);
+
 #endif /* KTMM_HOOK_HEADER_H */

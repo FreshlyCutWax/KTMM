@@ -26,7 +26,7 @@
  * The kprobes API can be found in:
  * 	include/linux/kprobes.h
  */
-static unsigned long symbol_lookup(const char *symbol_name)
+unsigned long symbol_lookup(const char *symbol_name)
 {
 	unsigned long ret;
 
