@@ -1,4 +1,4 @@
-# CSC450-G4 #
+# KTMM: Kernel Tiered Memory Module #
 The KTMM Project is a module for the Linux kernel designed to enhance the current Clock
 algorithm for page replacement. The implementation is an alternate approach to a dynamic
 tiering system for memory intensive applications aimed at modern server platforms. Most 
